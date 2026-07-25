@@ -817,6 +817,47 @@ def _apply_retina_regedit(wine: str, env: dict, retina_mode: bool) -> None:
         log(f"Warning: regedit failed: {exc}")
 
 
+def _apply_gecko_regedit(wine: str, env: dict) -> None:
+    """Point mshtml.dll at Wine Gecko so embedded-HTML/COM rendering (EULA text, WiX Burn's own
+    bootstrapper chrome, any embedded browser control) actually works, for any launch where
+    _unified_env() left mshtml enabled (needs_dotnet=True -- see _unified_env's dll_ovr). Our
+    unified engine ships no Gecko package of its own (unlike Wine Stable/D3DMetal), so builtin
+    mshtml.dll loads but can't render anything without this. Sourced from the SAME self-contained
+    redist pack that already provisions wine-mono/d3dcompiler_47 for the unified engine (deps/
+    redist/wine-gecko/) -- deliberately NOT Wine Stable.app: unified wine is meant to eventually
+    replace Wine Stable outright, so it can't depend on it still being installed. Sets BOTH the
+    plain and Wow6432Node views since a 32-bit process's HKLM\\Software\\Wine view is WOW64-
+    redirected to Wow6432Node. Confirmed live against EA App's installer."""
+    src = _redist_dir()
+    gecko_dir = (src / "wine-gecko") if src else None
+    x64 = gecko_dir / "wine-gecko-2.47.4-x86_64" if gecko_dir else None
+    x86 = gecko_dir / "wine-gecko-2.47.4-x86" if gecko_dir else None
+    if not x64 or not x64.is_dir() or not x86.is_dir():
+        log("gecko: redist wine-gecko pack not bundled (deps/redist/wine-gecko) -- embedded HTML/CEF UIs may not render")
+        return
+
+    def _win_path(p: Path) -> str:
+        # macOS abs path -> wine's Z: drive mapping; each '/' becomes a doubled '\\' in one
+        # step since REGEDIT4 string values need every backslash escaped.
+        return "Z:" + str(p).replace("/", "\\\\")
+
+    reg_content = (
+        "REGEDIT4\n\n"
+        "[HKEY_LOCAL_MACHINE\\Software\\Wine\\MSHTML\\2.47.4]\n"
+        f'"GeckoPath"="{_win_path(x64)}"\n\n'
+        "[HKEY_LOCAL_MACHINE\\Software\\Wow6432Node\\Wine\\MSHTML\\2.47.4]\n"
+        f'"GeckoPath"="{_win_path(x86)}"\n'
+    )
+    try:
+        reg_file = Path(tempfile.gettempdir()) / "wine_gecko.reg"
+        reg_file.write_text(reg_content, encoding="utf-8")
+        subprocess.run([wine, "regedit", str(reg_file)], env=env, timeout=300,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        log("Applied regedit: mshtml GeckoPath -> redist wine-gecko 2.47.4")
+    except Exception as exc:
+        log(f"Warning: gecko regedit failed: {exc}")
+
+
 
 def _apply_sync_env(env: Dict[str, str], esync: Optional[bool], msync: Optional[bool]) -> Dict[str, str]:
     """Apply optional per-launch esync/msync flags.
@@ -2517,27 +2558,33 @@ def cmd_scan_apps(params: Dict[str, Any]) -> Any:
             if key not in found:
                 found[key] = {"name": lnk.stem, "exe": key, "args": info.get("args", "")}
 
-    # 2. Fallback: one app per Program Files subfolder when no shortcuts exist
-    if not found:
-        for pf in (drive_c / "Program Files", drive_c / "Program Files (x86)"):
-            if not pf.exists():
+    # 2. Fallback: one app per Program Files subfolder for apps with no shortcut of
+    # their own. Bradar this used to be gated on "if not found" (the WHOLE bottle
+    # has zero shortcuts) instead of per-app -- the moment ANY app in the bottle got
+    # a real Start Menu shortcut (e.g. a proper installer like VS Code's own), this
+    # entire fallback stopped running and silently dropped every app that was only
+    # ever discoverable through it (tools with no Start Menu entry of their own).
+    # The existing "key not in found" dedup below already prevents double-counting
+    # anything a shortcut already found, so this can just always run.
+    for pf in (drive_c / "Program Files", drive_c / "Program Files (x86)"):
+        if not pf.exists():
+            continue
+        try:
+            children = [c for c in pf.iterdir() if c.is_dir()]
+        except Exception:
+            children = []
+        for child in children:
+            if child.name.lower() in WINE_DEFAULT_DIRS:
                 continue
-            try:
-                children = [c for c in pf.iterdir() if c.is_dir()]
-            except Exception:
-                children = []
-            for child in children:
-                if child.name.lower() in WINE_DEFAULT_DIRS:
-                    continue
-                exe = _detect_exe(child, child.name, child.name)
-                if not exe:
-                    continue
-                exe_path = Path(exe)
-                if _excluded(exe_path):
-                    continue
-                key = str(exe_path)
-                if key not in found:
-                    found[key] = {"name": child.name, "exe": key, "args": ""}
+            exe = _detect_exe(child, child.name, child.name)
+            if not exe:
+                continue
+            exe_path = Path(exe)
+            if _excluded(exe_path):
+                continue
+            key = str(exe_path)
+            if key not in found:
+                found[key] = {"name": child.name, "exe": key, "args": ""}
 
     apps: List[Dict[str, Any]] = []
     for entry in found.values():
@@ -2825,9 +2872,25 @@ def _unified_d3d_dir() -> Optional[Path]:
 
 def _d3dmetal_native_dir() -> Path:
     """Where libd3dshared.dylib + D3DMetal.framework live for the d3dmetal backend
-    (bundled pack first, then the dev D3DMetalTesting tree)."""
+    (bundled pack first, then the dev D3DMetalTesting tree).
+
+    Require BOTH files, not just libd3dshared.dylib. libd3dshared dlopens D3DMetal via
+    @rpath=@loader_path, i.e. it looks for D3DMetal.framework RIGHT NEXT TO ITSELF -- so a
+    dir with the dylib but no framework is not a usable d3dmetal pack, it's a trap: routing
+    d3d there loads fine, logs "[D3DMETAL_FB] dlopen ok" + resolves d3d11/dxgi, and only
+    then dies on `Assertion failed: (GFXTHandle && "Failed to dlopen D3DMetal") ... shared.mm`
+    with no hint that a FILE is missing. Hit live 2026-07-25: wine-unified/mnc-d3d shipped
+    the dylib but not the framework (the wine-installer overlay had both), so every
+    d3dmetal launch under the unified engine asserted. Checking both here makes it fall
+    through to a pack that is actually complete instead."""
+    for d in (UNIFIED_D3D_DIR, D3DMETAL_NATIVE_DIR):
+        if (d / "libd3dshared.dylib").exists() and (d / "D3DMetal.framework").exists():
+            return d
+    # nothing complete -- warn loudly rather than silently returning a broken pack
     for d in (UNIFIED_D3D_DIR, D3DMETAL_NATIVE_DIR):
         if (d / "libd3dshared.dylib").exists():
+            log(f"d3dmetal: {d} has libd3dshared.dylib but NO D3DMetal.framework next to it "
+                f"-> d3dmetal launches will assert in shared.mm; copy the framework there")
             return d
     return D3DMETAL_NATIVE_DIR
 
@@ -3127,10 +3190,14 @@ def _unified_game_backend(bottle_cfg: Dict[str, Any], backend: str = "") -> str:
 
 def _unified_env(prefix: str, game_backend: str, metal_hud: bool = False,
                  for_steam: bool = False, gst_debug: str = "",
-                 needs_dotnet: bool = False) -> Dict[str, str]:
+                 needs_dotnet: bool = False, cef_safe_mode: bool = False) -> Dict[str, str]:
     """Env for the unified wine. Steam exes always render via DXMT (loader gate);
     non-steam games follow MNC_GAME_BACKEND. GStreamer (MF/H.264 video) is wired for
-    GAMES ONLY -- Steam CEF crashes if it touches GStreamer so it gets none."""
+    GAMES ONLY -- Steam CEF crashes if it touches GStreamer so it gets none.
+    cef_safe_mode generalizes the Steam/EA CEF workaround (winegstreamer-block +
+    GPU-spoof flag injection) to any launch that opted in via force_dxmt_cef --
+    e.g. arbitrary "Applications" whose own CEF/Electron helper subprocesses
+    have no fixed name to hardcode, unlike Steam's/EA's."""
     env = dict(os.environ)
     for var in ("GTK_PATH", "GTK_EXE_PREFIX", "GTK_DATA_PREFIX", "GDK_PIXBUF_MODULEDIR",
                 "GDK_PIXBUF_MODULE_FILE", "GTK_IM_MODULE_FILE", "XDG_DATA_DIRS"):
@@ -3154,8 +3221,17 @@ def _unified_env(prefix: str, game_backend: str, metal_hud: bool = False,
     # Bradar d3dcompiler_47=n,b -> the real MS DLL we provision (native FIRST) with wines weak
     # builtin as fallbak (NEVER native alone, winetricks #2344). mscoree= disables .NET (kills
     # the CrashReport red-herring) EXCEPT for needs_dotnet games, where wine-mono must load.
+    # mshtml follows the SAME gate as mscoree: a plain game never touches embedded HTML/COM
+    # rendering, but anything needing a real CLR (WiX Burn installers w/ managed custom actions,
+    # EA App) commonly ALSO needs mshtml for its own UI (EULA text, Burn's bootstrapper chrome).
+    # Confirmed live: unconditionally blanking mshtml here broke EA App's installer entirely
+    # (mshtml.dll couldn't even load -> "class not registered" for its HTMLDocument CLSID),
+    # not just a missing-Gecko-path symptom. See _apply_gecko_regedit (called alongside
+    # _install_wine_mono at every needs_dotnet call site) for the matching Gecko provisioning --
+    # builtin mshtml still can't render anything without a Gecko package to point at.
     _mscoree = "" if needs_dotnet else "mscoree=;"
-    dll_ovr = f"winemenubuilder.exe=d;{_mscoree}mshtml=;d3dcompiler_47=n,b;nvapi,nvapi64="
+    _mshtml = "" if needs_dotnet else "mshtml=;"
+    dll_ovr = f"winemenubuilder.exe=d;{_mscoree}{_mshtml}d3dcompiler_47=n,b;nvapi,nvapi64="
     env.update({
         "WINEPREFIX": str(prefix),
         # msync OFF by default. The bundled unified wine is msync-capable (server
@@ -3179,6 +3255,11 @@ def _unified_env(prefix: str, game_backend: str, metal_hud: bool = False,
         # the PE loader resolving 32-bit builtins from the wine lib dir post-bootstrap
         "MNC_SKIP_WOW64_INSTALL": "1",
         "MNC_GAME_BACKEND": game_backend,
+        # Bradar generalizes is_steam_client_process()'s hardcoded name-list gate (loader.c) and
+        # kernelbase's MNC_WEBHELPER_FLAGS/MNC_EA_WEBHELPER_EXTRA_FLAGS name checks (process.c) to
+        # any launch, not just Steam/EA -- inherited by the whole process tree so it reaches CEF
+        # helper subprocesses regardless of what they're named.
+        "MNC_CEF_SAFE_MODE": "1" if cef_safe_mode else "0",
         # Bradar EA App's CEF is genuinely multi-process (unlike Steam's steamwebhelper, which
         # this never touches): its GPU/renderer subprocess creates a Metal swapchain for a HWND
         # owned by a different process, which DXMT hard-rejects ("cross-process swapchain not
@@ -4172,6 +4253,9 @@ def _launch_ea_app(prefix: str, exe_path: Path, args: str, params: Dict[str, Any
     # GStreamer STRIPPED (for_steam=True), d3dcompiler_47=n,b already in the override.
     env = _unified_env(prefix, "d3dmetal", metal_hud=False, for_steam=True, needs_dotnet=True)
     env["WINEDEBUG"] = "-all,+err"
+    iw = _prehack22_wine()
+    if iw:
+        _apply_gecko_regedit(iw, env)     # mshtml is enabled above (needs_dotnet); give it a Gecko to render with
     flags = os.environ.get(
         "MNC_EA_CEF_FLAGS",
         "--no-sandbox --disable-gpu --disable-gpu-compositing --in-process-gpu",
@@ -4207,12 +4291,15 @@ def _launch_game_unified(prefix: str, exe: str, args: str, bottle_cfg: Dict[str,
         _running_games[proc.pid] = proc
         log(f"launch: SteamSetup.exe routed to pre-HACK22 installer wine (silent); log {logf}")
         return {"pid": proc.pid}
-    # Bradar the EA app (EADesktop.exe) is a CEF/Chromium launcher that HACK22 breaks (mscoree forced
-    # off + %gs fault-storm + GStreamer crashs its CEF) n whose embedded browser blue-blanks on the
-    # unified wine -> route it to a gated pre-HACK22 path w/ the CEF software-GPU fix. Additive; the
-    # unified engine + HACK22 (Steam/RE4) r untouched. Triggerd by launcher_type=='ea' OR the exe name.
-    if bottle_cfg.get("launcher_type") == "ea" or exe_path.name.lower() == "eadesktop.exe":
-        return _launch_ea_app(str(prefix), exe_path, args, params)
+    # DEPRECATED 2026-07-25: the EA app (EADesktop.exe) used to be routed to a gated pre-HACK22
+    # overlay path (_launch_ea_app) becuse HACK22 appeard to break its CEF/mscoree startup. The
+    # real cause was never HACK22: it was the missing Rosetta-2 WoW64 thunk workaround in
+    # dlls/wow64cpu/cpu.c (far ljmp not switching the CPU to 64-bit under Rosetta, so
+    # syscall_32to64's body decoded as 32-bit n faulted). That is fixed in the engine now
+    # (MNC ROSETTA-THUNK / CW HACK 20760), so EA App no longer needs a special launch path --
+    # it goes through the SAME generic "Application" route as any other CEF/Chromium app
+    # (force_dxmt_cef -> DXMT + the CEF flag injection), on the unified wine. Keeping one code
+    # path here is the whole point: no per-app exe-name gating, no overlay wine to maintain.
     _stage_unified_dlls(str(prefix))
     _stage_unified_mf(str(prefix))
     _provision_redist_dlls(str(prefix))   # real MS d3dcompiler_47 file-drop (no installer, safe)
@@ -4276,7 +4363,7 @@ def _launch_game_unified(prefix: str, exe: str, args: str, bottle_cfg: Dict[str,
             except Exception as exc:
                 log(f"unified: steam auto-launch failed: {exc} (continuing)")
     env = _unified_env(prefix, backend, metal_hud, gst_debug=("5" if debug else "3"),
-                       needs_dotnet=needs_dotnet)
+                       needs_dotnet=needs_dotnet, cef_safe_mode=bool(params.get("force_dxmt_cef")))
     # Bradar VR: register the wineopenxr bridge as the prefixs active OpenXR runtime + force
     # our bundled x86_64 Monado runtime (an arm64 system one wont dlopen into the Rosetta wine)
     if backend == "vr":
@@ -4307,8 +4394,28 @@ def _launch_game_unified(prefix: str, exe: str, args: str, bottle_cfg: Dict[str,
     # the latter is the install-style loader and cannot find the build nls -> l_intl.nls fails
     wine = str(bt / "wine")
     _apply_retina_unified(bt, wine, env, params.get("retina_mode", bottle_cfg.get("retina_mode", False)))
+    if needs_dotnet:
+        _apply_gecko_regedit(wine, env)   # mshtml is enabled above (needs_dotnet); give it a Gecko to render with
     safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", exe_path.stem)
     log_path = str(LOG_DIR / f"{safe_name}-wine.log")
+    # CEF-safe-mode Applications: deliver the GPU-spoof + single-process switches on the
+    # launched exe's OWN argv. The engine (kernelbase/process.c) only injects these when it
+    # intercepts CreateProcess -- i.e. for CHILD processes -- but the exe we start here IS the
+    # CEF *browser* process, launched directly by us, so that hook never fires for it and it
+    # comes up with no window at all (confirmed live with EA App: CEF children spawned n died,
+    # EADesktop sat at 0% CPU logging "Ui initialization completed" with nothing on screen).
+    # The old EA-only path hardcoded these onto EADesktop.exe's argv; doing it here instead
+    # means ANY Application/launcher gets it with no exe-name gating. Chromium forwards the
+    # switches to its own children, so one delivery covers the whole tree. Never clobber a
+    # user-supplied switch.
+    if params.get("force_dxmt_cef"):
+        _cef_argv = (env.get("MNC_WEBHELPER_FLAGS", "") + " "
+                     + env.get("MNC_EA_WEBHELPER_EXTRA_FLAGS", "")).split()
+        _have = {p.split("=", 1)[0] for p in (shlex.split(args) if args else []) if p.startswith("--")}
+        _add = [f for f in _cef_argv if f.split("=", 1)[0] not in _have]
+        if _add:
+            args = ((args + " ") if args else "") + " ".join(_add)
+            log(f"CEF-safe-mode Application: appended {len(_add)} CEF/GPU switch(es) to argv")
     quoted_args = (" " + args) if args else ""
     cmd = (
         # export DYLD inside the shell. the outer arch (SIP-restricted) strips DYLD_* so
@@ -4972,15 +5079,28 @@ _ea_app_setup_proc: Optional[subprocess.Popen] = None
 def _download_and_run_eaapp_setup(prefix: str, wine: str, setup_path: Optional[str] = None) -> None:
     """Run EAappInstaller.exe in the given prefix (background thread). Same
     download/silent-install pattern as _download_and_run_steam_setup --
-    reuses _run_installer_prehack22 unmodified.
+    reuses _run_installer_prehack22.
 
-    NOTE: a battle-tested Wine install script for EA App (Lutris) requires
-    `winetricks d3dcompiler_47` as a prerequisite and uses `/silent` rather
-    than `/S`. This app has no winetricks integration and DXMT/D3DMetal
-    handle D3D shader compilation differently than vanilla Wine+DXVK, so
-    it's not yet confirmed whether that prerequisite applies here too --
-    verify against a real install (check mnc-eaapp-installer.log for a
-    d3dcompiler-related failure) before adding it speculatively."""
+    CONFIRMED live (2026-07-21): the Lutris prerequisite note below was right.
+    A fresh bottle with none of _launch_ea_app's prerequisites (real MS
+    d3dcompiler_47, wine-mono, corefonts, mscoree enabled) fails EA App's own
+    installer with "err:msi:ITERATE_Actions Execution halted, action
+    L"JunoInitializeSession" returned 1603" plus repeated
+    "err:mscoree:LoadLibraryShim error reading registry key for installroot" --
+    an install-time custom action needs a working CLR, which the plain
+    for_steam=False env explicitly disables (mscoree=;). Matches a public
+    Linux Mint forum report hitting the identical JunoInitializeSession/1603
+    failure. A bottle that happened to already have these from unrelated
+    earlier winetricks/game activity (real d3dcompiler_47 via `winetricks
+    d3dcompiler_47`, in particular) installs fine, which is why this went
+    unnoticed until tested against a genuinely fresh bottle.
+
+    NOTE: the SAME 1603 failure still reproduces on the pre-HACK22 overlay even
+    WITH all these prerequisites in place, while the identical installer/prefix
+    setup installs clean under plain Wine Stable -- so there's a genuine,
+    not-yet-root-caused difference in our own wine build (pre-HACK22 ntdll +
+    whatever else differs from stock) breaking this one MSI custom action.
+    Actively being investigated at the engine level rather than worked around."""
     global _ea_app_setup_proc
     try:
         if setup_path and Path(setup_path).expanduser().exists():
@@ -5005,6 +5125,19 @@ def _download_and_run_eaapp_setup(prefix: str, wine: str, setup_path: Optional[s
                     with urllib.request.urlopen(EA_APP_SETUP_URL, context=noverify, timeout=300) as resp:
                         exe.write_bytes(resp.read())
                 log("EAappInstaller.exe downloaded.")
+        # Same prerequisites _launch_ea_app already provisions before running EA App --
+        # the installer's own JunoInitializeSession custom action needs all of these
+        # (confirmed live, see docstring above), not just the launch path.
+        _provision_redist_dlls(prefix)                      # real MS d3dcompiler_47
+        try:
+            _install_wine_mono(prefix, "d3dmetal")           # working CLR for the installer's custom actions
+        except Exception as exc:
+            log(f"EA App install: wine-mono install skipped: {exc}")
+        try:
+            _install_corefonts(prefix)                       # MS core fonts for the installer's own CEF UI
+        except Exception as exc:
+            log(f"EA App install: corefonts install skipped: {exc}")
+
         logf = str(Path(prefix) / "mnc-eaapp-installer.log")
         log(f"Launching EAappInstaller.exe in {prefix} (pre-HACK22 wine so the installer stub wont fault-storm; log {logf})")
         # Confirmed live: neither /S nor /silent produced an actual silent install -- the
@@ -5014,17 +5147,15 @@ def _download_and_run_eaapp_setup(prefix: str, wine: str, setup_path: Optional[s
         # well-documented CEF-under-Wine failure mode (blank/non-rendering window unless
         # GPU compositing is disabled) rather than a silent-flag problem. Append the
         # standard CEF/Chromium flags known to fix this class of bug.
-        # Tried forcing WINEMSYNC=0 here too (same crash-cascade rationale as the actual
-        # EA App launch below) but it broke the PRE-HACK22 wine build itself: "unimplemented
-        # function ntdll.dll.__wine_unix_call, aborting" (live-confirmed), the one variable
-        # changed vs every other _run_installer_prehack22 caller (Steam, redists), which all
-        # leave WINEMSYNC at _unified_env's default and work fine. Reverted -- this installer
-        # runs on a wine build with different unixlib support than the unified engine where
-        # the msync crash was actually bisected, so the fix doesn't transfer here.
+        install_env = _unified_env(prefix, "d3dmetal", False, for_steam=False, needs_dotnet=True)
+        install_env["WINEDEBUG"] = "-all,+err"
+        iw = _prehack22_wine()
+        if iw:
+            _apply_gecko_regedit(iw, install_env)   # mshtml is enabled above (needs_dotnet); give it a Gecko to render with
         proc = _run_installer_prehack22(
             prefix,
             [str(exe), "/silent", "--disable-gpu", "--disable-gpu-compositing", "--in-process-gpu"],
-            "d3dmetal", log_path=logf,
+            "d3dmetal", log_path=logf, env=install_env,
         )
         _ea_app_setup_proc = proc
     except Exception as exc:

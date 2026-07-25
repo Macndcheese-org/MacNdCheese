@@ -624,12 +624,31 @@ final class BackendClient: ObservableObject {
         let bottle = bottles.first { $0.path == prefix }
         let backendId = bottle?.defaultBackend ?? "auto"
         let installDir = URL(fileURLWithPath: app.exe).deletingLastPathComponent().path
+        // Bradar Applications have no per-app config store (unlike Games, keyed by appid),
+        // so the bottle's own Metal HUD checkbox is the only source -- fetch it the same way
+        // every other launchGame() caller does (SettingsSheet/GameDetailView/GameLaunchSheet
+        // etc all read config["metal_hud"]). Without this, launchGame()'s metalHud parameter
+        // silently defaults to false and the checkbox has no effect on Application launches.
+        let cfg = await getBottleConfig(path: prefix)
+        let metalHud = cfg?["metal_hud"] as? Bool ?? false
+        // Bradar same bug as metalHud, for retinaMode: launchGame()'s parameter silently
+        // defaulted to false, so every Application ran non-Retina regardless of the actual
+        // display -- blurry UI, and (per Wine's own long-standing RetinaMode mismatch bugs)
+        // a real Retina NSWindow being told by Wine it's non-Retina is exactly the class of
+        // bug that corrupts mouse-event coordinate mapping, which is almost certainly what's
+        // behind the click/selection offset seen in VS Code. There's no per-app config to
+        // check retina_mode against (same as metal_hud above), so fall back straight to the
+        // real display's own backing scale factor, same as every other launchGame() caller
+        // does when its own per-game/bottle override is absent (see GameGridView.directLaunch).
+        let retinaMode = NSScreen.main.map { $0.backingScaleFactor > 1.0 } ?? false
         await launchGame(
             prefix: prefix,
             exe: app.exe,
             args: app.args,
             backend: backendId,
             installDir: installDir,
+            retinaMode: retinaMode,
+            metalHud: metalHud,
             gameName: app.name,
             // Bradar a discovered windows app aint a steam game, so dont drag steam up
             // just to run it. if steam happen to be up already it still see it, we just
