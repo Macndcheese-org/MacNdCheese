@@ -2585,6 +2585,13 @@ def cmd_scan_apps(params: Dict[str, Any]) -> Any:
         (drive_c / "Program Files" / "Steam"),   # fresh fast-boot prefixes land Steam here
         (drive_c / "Program Files" / "Epic Games"),
     ]
+    # ...and every game the EA app has installed. Applications is for APPS; a game belongs on
+    # the Games tab (it shows up there via its store entry). Battlefield 4 was landing here as
+    # "EA Games" -- the Program Files fallback scan below found EA Games/Battlefield 4/bf4.exe
+    # and named the entry after the folder. Read the install dirs from EA's own registry record
+    # rather than hardcoding a folder name, so a custom install location is covered too. The
+    # EA app ITSELF stays listed: it lives under Electronic Arts\, not in a game's install dir.
+    excluded_roots += [ea["dir"] for ea in _ea_installed_games(prefix)]
 
     drive_c_resolved = drive_c.resolve()
 
@@ -3476,6 +3483,90 @@ def _steam_dir(prefix) -> Path:
     if (noarch / "steam.exe").exists():
         return noarch
     return x86
+
+
+def _unreg_str(value: str) -> str:
+    """Decode a wine system.reg string value: \\\\ -> \\, \\" -> ", \\xNNNN -> the char."""
+    out, i = [], 0
+    while i < len(value):
+        c = value[i]
+        if c == "\\" and i + 1 < len(value):
+            nxt = value[i + 1]
+            if nxt == "x" and i + 5 < len(value):
+                try:
+                    out.append(chr(int(value[i + 2:i + 6], 16))); i += 6; continue
+                except ValueError:
+                    pass
+            out.append(nxt); i += 2; continue
+        out.append(c); i += 1
+    return "".join(out)
+
+
+def _ea_installed_games(prefix) -> List[Dict[str, Any]]:
+    """Every EA-App-installed game in a prefix, from EA's OWN record.
+
+    The EA app writes HKLM\\Software\\EA Games\\<Title> (plus the Wow6432Node mirror) with
+    DisplayName + "Install Dir" for each title it installs -- live-confirmed on Battlefield 4.
+    That is authoritative, covers a custom install location, and needs no per-title knowledge,
+    so prefer it over globbing a hardcoded "EA Games" folder. Returns [{"name", "dir"}] for
+    the entries whose install dir actually exists on disk."""
+    try:
+        reg = (Path(prefix).expanduser() / "system.reg").read_text(errors="ignore")
+    except Exception:
+        return []
+    out: Dict[str, Dict[str, Any]] = {}
+    # [Software\\EA Games\\<Title>]  or  [Software\\Wow6432Node\\EA Games\\<Title>]
+    # note the trailing ".*": wine writes the section's mtime after the closing bracket
+    for m in re.finditer(r'(?m)^\[Software\\\\(?:Wow6432Node\\\\)?EA Games\\\\([^\]\\\\]+)\].*$', reg):
+        body = reg[m.end():]
+        end = body.find("\n[")
+        body = body[:end] if end != -1 else body
+        dm = re.search(r'(?m)^"DisplayName"="([^"]*)"', body)
+        # value is backslash-escaped: a run of non-quote chars, or an escape pair (\\ , \x2122)
+        im = re.search(r'(?m)^"Install Dir"="((?:[^"\\]|\\.)*)"', body)
+        if not im:
+            continue
+        win_dir = _unreg_str(im.group(1))
+        host = _win_path_to_host(Path(prefix).expanduser(), win_dir.rstrip("\\/") )
+        if not host or not host.is_dir():
+            continue
+        name = _unreg_str(dm.group(1)) if dm else _unreg_str(m.group(1))
+        out[str(host)] = {"name": name, "dir": host}   # dedup the Wow6432Node mirror
+    return list(out.values())
+
+
+def _title_tokens(title: str) -> List[str]:
+    """Split a game title into comparable tokens, dropping trademark marks, punctuation and
+    case: "Battlefield 4(tm) Premium Edition" -> ["battlefield", "4", "premium", "edition"]."""
+    return re.findall(r"[a-z0-9]+", (title or "").lower())
+
+
+def _titles_match(a: List[str], b: List[str]) -> bool:
+    """Whether two tokenized titles name the SAME game across two stores.
+
+    One store's title routinely carries an edition/bundle suffix the other's does not
+    ("Battlefield 4(tm) Premium Edition" on Epic vs "Battlefield 4(tm)" in EA's registry), so
+    accept a token-prefix match. But a purely NUMERIC tail means a different entry in a series,
+    not an edition -- without that guard "skate." would match an installed "Skate 3", since
+    "skate" is a prefix of it either way."""
+    short, long_ = (a, b) if len(a) <= len(b) else (b, a)
+    if not short or len("".join(short)) < 4:
+        return False
+    if long_[:len(short)] != short:
+        return False
+    extra = long_[len(short):]
+    return not (extra and all(t.isdigit() for t in extra))
+
+
+def _ea_install_for_title(title: str, prefix) -> Optional[Dict[str, Any]]:
+    """Match a store title to an EA-App install of the same game, or None."""
+    want = _title_tokens(title)
+    best, best_len = None, -1
+    for ea in _ea_installed_games(prefix):
+        have = _title_tokens(ea["name"])
+        if _titles_match(want, have) and len(have) > best_len:
+            best, best_len = ea, len(have)   # most specific match wins
+    return best
 
 
 def _ea_app_dir(prefix) -> Path:
@@ -8053,6 +8144,17 @@ def _build_games_list(prefix: str, owned_list: List[Dict[str, Any]]) -> List[Dic
             continue
         is_installed = app_name in installed_here
         install_dir = installed_here[app_name].get("install_path", "") if is_installed else ""
+        third_party = _epic_third_party_store(g)
+        # A third-party-managed title (EA app etc.) is installed by that launcher, not by
+        # legendary, so legendary's installed record NEVER lists it -- the card stayed on
+        # "Download" forever even with the game sitting on disk. Ask the managing launcher's
+        # own record instead. Only consulted when legendary has nothing, so a normal Epic
+        # install is completely unaffected.
+        if not is_installed and third_party:
+            ea = _ea_install_for_title(app_title, prefix)
+            if ea:
+                is_installed = True
+                install_dir = str(ea["dir"])
         exe = _detect_exe(Path(install_dir), app_name, app_title) if install_dir else None
         cover_url = _legendary_cover_url(g.get("metadata", g))
         games.append({
@@ -8067,7 +8169,7 @@ def _build_games_list(prefix: str, owned_list: List[Dict[str, Any]]) -> List[Dic
             "is_installed": is_installed,
             "update_available": False,
             "epic_app_name": app_name,
-            "third_party_store": _epic_third_party_store(g),
+            "third_party_store": third_party,
         })
     games.sort(key=lambda g: (0 if g["is_installed"] else 1, g["name"].lower()))
     return games
