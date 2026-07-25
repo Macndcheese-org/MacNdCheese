@@ -3343,17 +3343,23 @@ def _unified_env(prefix: str, game_backend: str, metal_hud: bool = False,
         # any launch, not just Steam/EA -- inherited by the whole process tree so it reaches CEF
         # helper subprocesses regardless of what they're named.
         "MNC_CEF_SAFE_MODE": "1" if cef_safe_mode else "0",
-        # Bradar EA App's CEF is genuinely multi-process (unlike Steam's steamwebhelper, which
-        # this never touches): its GPU/renderer subprocess creates a Metal swapchain for a HWND
-        # owned by a different process, which DXMT hard-rejects ("cross-process swapchain not
-        # supported yet", d3d11_swapchain.cpp) and Wine's own macdrv has no cross-process child-
-        # window Metal compositing for either (both confirmed upstream-unfixed as of 2026-07,
-        # tracked via wine!11058/!11257 + dxmt#151). --single-process merges renderer+GPU+browser
-        # into one process so the swapchain's owning process always matches the caller -- live-
-        # confirmed working (Metal HUD shows "DXMT D3D11 FL_11_1" + real compositing). Kept OFF
-        # steamwebhelper/SocialClubHelper (MNC_WEBHELPER_FLAGS below) since those already work
-        # without it and single-process removes their CEF process isolation.
-        "MNC_EA_WEBHELPER_EXTRA_FLAGS": "--single-process",
+        # Bradar MNC_EA_WEBHELPER_EXTRA_FLAGS is deliberately NOT set (the engine still honours
+        # it as a manual escape hatch for a CEF app that needs extra switches -- it just has no
+        # default any more). It used to carry "--single-process" on the theory that EA App's
+        # multi-process CEF would make its GPU subprocess build a Metal swapchain for a HWND
+        # owned by another process, which DXMT rejects. 2026-07-25: measured, and BOTH halves of
+        # that were wrong. --in-process-gpu (in MNC_WEBHELPER_FLAGS below) already puts the GPU
+        # in the browser process -- the one that owns the HWND -- so with a normal multi-process
+        # CEF there are ZERO GPU-process crashes, zero cross-process swapchain rejections and
+        # zero "Failed to get metal layer" (the earlier blue-window run that prompted this had
+        # NO flags at all on its command line, so --in-process-gpu had never actually been tried
+        # on its own). And --single-process actively BROKE the app: it collapses the renderer
+        # into the browser process, so the renderer-side OnContextCreated that injects
+        # qt.webChannelTransport never runs -> EA's qwebchannelwrapper.js sees `qt` undefined,
+        # falls back to `new WebSocket("ws://127.0.0.1:4695")` which nothing ever listens on,
+        # times out after its own 30s CHANNEL_CONNECTION_TIMEOUT and leaves onLoginSuccess
+        # undefined -- sign-in completed but the UI never advanced past the login page. CEF
+        # documents single-process as debug-only; don't reach for it.
         # Bradar GPU-spoof so Steam CEF accepts ANGLE d3d11 -> DXMT (null-GPU crashes SwiftShader)
         # this is the exact load-bearing set from the proven steam-unified-run.sh
         "MNC_WEBHELPER_FLAGS": ("--no-sandbox --in-process-gpu --use-gl=angle --use-angle=d3d11 "
@@ -4033,6 +4039,42 @@ def _prehack22_wine() -> str:
         except Exception:
             continue
     return ""
+
+
+def _run_installer_unified(prefix: str, cmd_after_wine: List[str],
+                           backend: str = "dxmt",
+                           log_path: Optional[str] = None,
+                           env: Optional[Dict[str, str]] = None) -> subprocess.Popen:
+    """Launch an installer on the UNIFIED wine -- the pre-HACK22 overlay's replacement.
+
+    The whole reason _run_installer_prehack22 exists is that 32-bit NSIS/Burn stubs used to
+    fault-storm under the unified engine. That was root-caused 2026-07-25: the far `ljmp` in
+    dlls/wow64cpu/cpu.c's syscall_32to64 does not switch the CPU to 64-bit mode under
+    Rosetta 2, so the 64-bit body decoded as 32-bit and faulted (CW HACK 20760, now ported).
+    With that fixed, a 32-bit Burn bundle runs clean on the unified wine -- EA App's own
+    installer reaches "Apply complete, result: 0x0" -- so new callers should come here and
+    the overlay can be retired rather than grown.
+
+    Same mechanics as the overlay path: stage a real 32-bit subsystem first (a fast-booted
+    bottle with an empty syswow64 kills 32-bit installers with c0000135), run under
+    arch -x86_64 with an in-shell DYLD re-export (arch strips DYLD_*), and tee wine's output
+    to log_path so an install is never a silent black box."""
+    if env is None:
+        env = _unified_env(prefix, backend or "dxmt", False, for_steam=False)
+        env["WINEDEBUG"] = "-all,+err"
+    _stage_syswow64(prefix)
+    _ensure_progfiles_x86(prefix)
+    _stage_unified_dlls(prefix)
+    out = open(log_path, "w") if log_path else subprocess.DEVNULL
+    wine = str(_unified_build_dir() / "wine")
+    dyld = env.get("DYLD_FALLBACK_LIBRARY_PATH", "")
+    tail = " ".join(shlex.quote(a) for a in cmd_after_wine)
+    sh = (f"export DYLD_FALLBACK_LIBRARY_PATH={shlex.quote(dyld)}\n"
+          f"exec {shlex.quote(wine)} {tail}")
+    log(f"installer (unified wine): {cmd_after_wine}")
+    return subprocess.Popen(["/usr/bin/arch", "-x86_64", "/bin/bash", "-lc", sh],
+                            env=env, stdout=out, stderr=subprocess.STDOUT,
+                            start_new_session=True)
 
 
 def _run_installer_prehack22(prefix: str, cmd_after_wine: List[str],
@@ -5230,15 +5272,27 @@ def _download_and_run_eaapp_setup(prefix: str, wine: str, setup_path: Optional[s
         # well-documented CEF-under-Wine failure mode (blank/non-rendering window unless
         # GPU compositing is disabled) rather than a silent-flag problem. Append the
         # standard CEF/Chromium flags known to fix this class of bug.
-        install_env = _unified_env(prefix, "d3dmetal", False, for_steam=False, needs_dotnet=True)
+        #
+        # DEPRECATED 2026-07-25: this used to run on the pre-HACK22 overlay wine with
+        # Chromium's SOFTWARE compositor (--disable-gpu --disable-gpu-compositing). Both are
+        # gone. The 1603/JunoInitializeSession failure the docstring above describes was never
+        # a missing prerequisite or an overlay-vs-unified difference -- it was the missing
+        # Rosetta-2 WoW64 thunk workaround in dlls/wow64cpu/cpu.c (a far ljmp not switching the
+        # CPU to 64-bit, so syscall_32to64's body decoded as 32-bit and faulted). With that
+        # fixed in the engine, EA's own Burn installer runs to "Apply complete, result: 0x0"
+        # on the unified wine (live-confirmed 2026-07-25), so it takes the same generic CEF
+        # path as everything else: DXMT + cef_safe_mode, and real GPU rendering rather than
+        # the software fallback. The prerequisites above stay -- they are genuinely needed.
+        install_env = _unified_env(prefix, "dxmt", False, for_steam=False,
+                                   needs_dotnet=True, cef_safe_mode=True)
         install_env["WINEDEBUG"] = "-all,+err"
-        iw = _prehack22_wine()
-        if iw:
-            _apply_gecko_regedit(iw, install_env)   # mshtml is enabled above (needs_dotnet); give it a Gecko to render with
-        proc = _run_installer_prehack22(
-            prefix,
-            [str(exe), "/silent", "--disable-gpu", "--disable-gpu-compositing", "--in-process-gpu"],
-            "d3dmetal", log_path=logf, env=install_env,
+        wine_bin = str(_unified_build_dir() / "wine")
+        _apply_gecko_regedit(wine_bin, install_env)   # mshtml is enabled above (needs_dotnet)
+        # the installer stub IS a CEF browser process, and we start it directly, so hand it
+        # the switches on argv (the engine's CreateProcess hook only sees its children)
+        cef_argv = install_env.get("MNC_WEBHELPER_FLAGS", "").split()
+        proc = _run_installer_unified(
+            prefix, [str(exe), "/silent"] + cef_argv, log_path=logf, env=install_env,
         )
         _ea_app_setup_proc = proc
     except Exception as exc:
@@ -8921,8 +8975,17 @@ def cmd_legendary_launch_game(params: Dict[str, Any]) -> Any:
         # dxmt for the whole origin-launch regardless of bottle default -- matches the backend
         # already proven working end-to-end for EA App's own CEF UI this session.
         game_backend = "dxmt" if third_party_store else _unified_game_backend(bottle_cfg, backend)
+        # Bradar a third-party-managed title (BF4 etc.) launches by handing a link2ea:// URI to
+        # the EA App, so this launch IS a CEF launch even though the exe we invoke is `wine
+        # start`. It needs the same CEF treatment the Applications section gets or EA App comes
+        # up as an empty blue window: MNC_CEF_SAFE_MODE is what lets the engine recognise
+        # EADesktop.exe as a CEF browser process (libcef.dll beside it) and put the GPU-spoof
+        # switches on the command line Link2EA/EALaunchHelper builds for it -- we never invoke
+        # EADesktop ourselves here, so argv delivery cannot reach it. Also blocks winegstreamer
+        # for the tree, same as any other CEF app.
         env = _unified_env(prefix_expanded, game_backend, metal_hud,
-                            gst_debug=("5" if verbose_debug else "3"))
+                            gst_debug=("5" if verbose_debug else "3"),
+                            cef_safe_mode=bool(third_party_store))
         # bt/wine, not bt/loader/wine -- the loader-style path can't find the build nls
         wine_bin = str(bt / "wine")
     else:
