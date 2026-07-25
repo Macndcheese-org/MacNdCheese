@@ -1898,6 +1898,87 @@ def _unpatch_dxvk(game_dir: Path) -> None:
 # Steam library / game scanning helpers
 # ---------------------------------------------------------------------------
 
+# --- wine reparse points (Windows symlinks / directory junctions) ------------
+#
+# Wine does NOT store a Windows symlink/junction as a unix symlink. It stores it as an
+# EMPTY DIRECTORY carrying a `user.WINEREPARSE` xattr (the raw REPARSE_DATA_BUFFER) and
+# appends ONE '?' to the UNIX name -- '?' is illegal in a Windows filename so it can never
+# collide with a real file, and ntdll strips exactly one trailing '?' off every directory
+# entry on the way back to Windows (dlls/ntdll/unix/file.c, append_entry()). So a path
+# that opens perfectly INSIDE the bottle can look missing from Python: EA App's own
+# installer creates C:\...\EA Desktop\EA Desktop -> 13.754.0.6267\EA Desktop, which lands
+# on disk as a directory literally named "EA Desktop?" -- every Start Menu shortcut
+# through it failed Path.exists(), so EA App was silently dropped from the Apps section.
+# Resolve THROUGH the reparse point (read its target) rather than just tolerating the '?'
+# in the name: the path we hand back is then real on BOTH sides, so wine gets something it
+# can open and exe_dir / DLL staging / icon lookup keep working unchanged. Generic -- any
+# bottle, any app that creates a junction, no per-app knowledge.
+WINE_REPARSE_XATTR = "user.WINEREPARSE"
+_IO_REPARSE_TAG_SYMLINK = 0xA000000C
+_IO_REPARSE_TAG_MOUNT_POINT = 0xA0000003
+
+
+def _wine_reparse_target(link: Path, prefix: Path) -> Optional[Path]:
+    """Follow ONE wine reparse point to the host path it points at (None if it isn't one)."""
+    try:
+        out = subprocess.run(["xattr", "-px", WINE_REPARSE_XATTR, str(link)],
+                             capture_output=True, text=True, timeout=5)
+        if out.returncode != 0 or not out.stdout.strip():
+            return None
+        buf = bytes.fromhex("".join(out.stdout.split()))
+        tag = struct.unpack_from("<I", buf, 0)[0]
+        if tag == _IO_REPARSE_TAG_SYMLINK:
+            off, length, _po, _pl, flags = struct.unpack_from("<HHHHI", buf, 8)
+            base, relative = 20, bool(flags & 1)          # SYMLINK_FLAG_RELATIVE
+        elif tag == _IO_REPARSE_TAG_MOUNT_POINT:
+            off, length = struct.unpack_from("<HH", buf, 8)
+            base, relative = 16, False
+        else:
+            return None
+        target = buf[base + off:base + off + length].decode("utf-16-le", "ignore").rstrip("\x00")
+    except Exception:
+        return None
+    if not target:
+        return None
+    if relative:
+        return link.parent / target.replace("\\", "/")
+    if target.startswith("\\??\\"):                        # NT form: \??\C:\...
+        target = target[4:]
+    if len(target) > 2 and target[1] == ":":
+        return prefix / f"drive_{target[0].lower()}" / target[3:].replace("\\", "/")
+    return None
+
+
+def _resolve_wine_path(prefix: Path, path: Path, _depth: int = 0) -> Path:
+    """Rewrite `path` so any wine reparse point along it points at its real target.
+
+    Cheap by construction: a path that already exists is returned untouched after a single
+    stat, so the xattr/component walk only ever runs for a path Python couldn't find."""
+    if _depth > 8 or path.exists():
+        return path
+    try:
+        rel = path.relative_to(prefix)
+    except ValueError:
+        return path
+    cur = prefix
+    parts = rel.parts
+    for i, part in enumerate(parts):
+        nxt = cur / part
+        if nxt.exists():
+            cur = nxt
+            continue
+        link = cur / (part + "?")
+        if not link.exists():
+            return path            # genuinely missing -- let the caller's exists() fail
+        target = _wine_reparse_target(link, prefix)
+        if target is None:
+            return path
+        rest = parts[i + 1:]
+        return _resolve_wine_path(prefix, target.joinpath(*rest) if rest else target,
+                                  _depth + 1)
+    return cur
+
+
 def _windows_path_to_unix(prefix: Path, value: str) -> Path:
     normalized = value.replace("\\\\", "\\")
     if re.match(r"^[A-Za-z]:\\", normalized):
@@ -1906,7 +1987,7 @@ def _windows_path_to_unix(prefix: Path, value: str) -> Path:
         base = prefix / f"drive_{drive}"
         if drive == "c":
             base = prefix / "drive_c"
-        return base / remainder
+        return _resolve_wine_path(prefix, base / remainder)
     return Path(normalized.replace("\\", "/"))
 
 def _library_roots(prefix: Path, steam_dir: Path) -> List[Path]:
@@ -2477,7 +2558,9 @@ def _win_path_to_host(prefix: Path, win_path: str) -> Optional[Path]:
     if win_path[0].lower() != "c":  # we only manage the C: drive
         return None
     rest = win_path[3:].replace("\\", "/")
-    return prefix / "drive_c" / rest
+    # a shortcut target can legitimately run through a wine reparse point (EA App's
+    # Start Menu entry does) -- resolve it, or the path looks missing to Python
+    return _resolve_wine_path(prefix, prefix / "drive_c" / rest)
 
 
 def cmd_scan_apps(params: Dict[str, Any]) -> Any:
