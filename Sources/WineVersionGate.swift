@@ -126,6 +126,24 @@ final class WineVersionGate: ObservableObject {
         failed = fail
         done = true
         updating = false
+
+        if fail {
+            let logPath = Self.markerPath + "_error.log"
+            let formatter = ISO8601DateFormatter()
+            let timestamp = formatter.string(from: Date())
+            let header = "--- Wine Update Failed at \(timestamp) ---\n"
+            let logContent = header + logLines.joined(separator: "\n") + "\n"
+
+            if let fileHandle = FileHandle(forWritingAtPath: logPath) {
+                defer { try? fileHandle.close() }
+                fileHandle.seekToEndOfFile()
+                if let data = logContent.data(using: .utf8) {
+                    fileHandle.write(data)
+                }
+            } else {
+                try? logContent.write(toFile: logPath, atomically: true, encoding: .utf8)
+            }
+        }
     }
 
     nonisolated private static func compareVersions(_ a: String, isNewerThan b: String) -> Bool {
