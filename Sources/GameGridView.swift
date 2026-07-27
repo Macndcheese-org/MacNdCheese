@@ -318,6 +318,24 @@ struct GameCardView: View {
                         if isLaunching {
                             LaunchingOverlay(cornerRadius: 12)
                                 .frame(height: 220)
+                        }
+
+                        if !isReachable {
+                            VStack {
+                                HStack {
+                                    Spacer()
+                                    Text(L("Unreachable"))
+                                        .font(.caption2)
+                                        .fontWeight(.bold)
+                                        .padding(.horizontal, 6)
+                                        .padding(.vertical, 2)
+                                        .background(.orange.opacity(0.85))
+                                        .foregroundStyle(.white)
+                                        .clipShape(Capsule())
+                                        .padding(8)
+                                }
+                                Spacer()
+                            }
                         } else if isHovering {
                             // No redundant play button: the whole tile (and the
                             // gear) opens the game page, where the real Launch +
