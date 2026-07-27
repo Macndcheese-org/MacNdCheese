@@ -42,7 +42,7 @@ struct SidebarView: View {
                 Button {
                     showStore = true
                 } label: {
-                    Label(L("Store"), systemImage: "storefront")
+                    Label(L("Store & Stats"), systemImage: "storefront")
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)
