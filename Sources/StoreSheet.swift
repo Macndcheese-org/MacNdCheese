@@ -32,7 +32,7 @@ struct StoreView: View {
                 Image(systemName: "network")
                     .font(.system(size: 22))
                     .foregroundStyle(.tint)
-                Text(L("MacNCheese Community"))
+                Text(L("MacNCheese Stats & Showcase"))
                     .font(.title2)
                     .fontWeight(.semibold)
                 Spacer()
