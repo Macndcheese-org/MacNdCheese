@@ -6870,6 +6870,8 @@ def _ensure_steam_idle_watchdog() -> None:
 def cmd_get_steam_running(_params: Dict[str, Any]) -> Any:
     global _steam_process
     running = _steam_process is not None and _steam_process.poll() is None
+    if _steam_process is not None and not running:
+        _steam_process = None
     return {"running": running}
 
 
