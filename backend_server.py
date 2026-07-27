@@ -4667,7 +4667,7 @@ def cmd_launch_steam(params: Dict[str, Any]) -> Any:
     
     metal_hud_line = ""
     if bottle_cfg.get("metal_hud", False):
-        metal_hud_line = "export MTL_HUD_ENABLED=1\n"
+        metal_hud_line = "export MTL_HUD_ENABLED=1\nexport MTL_DEBUG_BUILD=1\n"
 
     
     heredoc = f"""\
