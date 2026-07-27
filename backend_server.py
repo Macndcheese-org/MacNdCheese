@@ -7973,6 +7973,8 @@ def cmd_legendary_auth(params: Dict[str, Any]) -> Any:
         output = result.stdout + result.stderr
         success_markers = ("Successfully logged in", "Logged in as", "login successful")
         if result.returncode == 0 or any(m.lower() in output.lower() for m in success_markers):
+            _legendary_games_cache[prefix] = {"games": [], "ts": 0, "scanning": True}
+            threading.Thread(target=_refresh_legendary_cache, args=(prefix,), daemon=True).start()
             auth = cmd_legendary_check_auth({"prefix": prefix})
             return {"ok": True, "display_name": auth.get("display_name", ""), "error": ""}
         return {"ok": False, "display_name": "", "error": output.strip()[:400]}
@@ -8082,9 +8084,10 @@ def cmd_nile_auth(params: Dict[str, Any]) -> Any:
             capture_output=True, text=True, timeout=60,
             env=_nile_env(prefix),
         )
-        # `register` has no explicit success marker on stdout — verify via `auth --status`.
         auth = cmd_nile_check_auth({"prefix": prefix})
         if auth.get("authenticated"):
+            _nile_games_cache[prefix] = {"games": [], "ts": 0, "scanning": True}
+            threading.Thread(target=_refresh_nile_cache, args=(prefix,), daemon=True).start()
             return {"ok": True, "display_name": auth.get("display_name", ""), "error": ""}
         output = (result.stdout + result.stderr).strip()[:400]
         return {"ok": False, "display_name": "", "error": output or "Registration failed"}
