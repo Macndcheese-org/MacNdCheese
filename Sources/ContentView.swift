@@ -144,7 +144,7 @@ struct ContentView: View {
     }
 
     private var detailTitle: String {
-        if showStore { return L("Store") }
+        if showStore { return L("Community") }
         if let bottle = activeBottle { return bottle.name }
         return "MacNCheese"
     }
