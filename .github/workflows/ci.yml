@@ -48,6 +48,10 @@ jobs:
         run: python3 -m py_compile backend_server.py
       - name: Compile-check the CLI (macndcheese)
         run: python3 -m py_compile macndcheese
+      - name: Lint backend scripts (ruff)
+        run: |
+          pip install ruff
+          ruff check backend_server.py macndcheese --select E9,F63,F7,F82
       - name: Shell syntax check (bash -n)
         run: |
           bash -n install.sh
