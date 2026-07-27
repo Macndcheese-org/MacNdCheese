@@ -29,7 +29,7 @@ struct StoreView: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 12) {
-                Image(systemName: "storefront")
+                Image(systemName: "network")
                     .font(.system(size: 22))
                     .foregroundStyle(.tint)
                 Text(L("MacNCheese Stats & Showcase"))

@@ -70,7 +70,7 @@ jobs:
             echo "HOMEBREW_TAP_TOKEN secret is not set, can't push to the tap repo." >&2
             exit 1
           fi
-          git clone -q "https://x-access-token:${GH_TOKEN}@github.com/realmaitreal/homebrew-macndcheese.git" /tmp/tap
+          git clone -q "https://x-access-token:${GH_TOKEN}@github.com/Macndcheese-org/homebrew-tap.git" /tmp/tap
           cp /tmp/macndcheese.rb /tmp/tap/Casks/macndcheese.rb
           cd /tmp/tap
           git config user.name "macndcheese-release-bot"
