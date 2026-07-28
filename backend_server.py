@@ -202,6 +202,7 @@ _nile_installing: bool = False
 _nile_installs: Dict[str, Any] = {}  # amazon_id -> (Popen, file, log_path, prefix)
 _nile_paused: Dict[str, str] = {}    # amazon_id -> prefix (paused downloads)
 _nile_games_cache: Dict[str, Any] = {}  # prefix -> {"games": [], "ts": float, "scanning": bool}
+_nile_cache_lock = threading.Lock()
 _NILE_CACHE_TTL = 300  # seconds before a background re-fetch is triggered
 
 # Download queue — one install runs at a time, others wait.
