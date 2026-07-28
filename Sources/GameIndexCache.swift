@@ -76,10 +76,10 @@ enum GameIndexCache {
         guard parts.count >= 2 else { return nil }
 
         if parts[0] == "epic" {
-            let epicAppName = parts[1]
+            let epicAppName = parts.dropFirst().joined(separator: ":::")
             return allGames().first { $0.epicAppName == epicAppName }
         } else if parts[0] == "amazon" {
-            let amazonId = parts[1]
+            let amazonId = parts.dropFirst().joined(separator: ":::")
             return allGames().first { $0.amazonId == amazonId }
         } else {
             let appid = parts.last!
