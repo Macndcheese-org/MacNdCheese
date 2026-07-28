@@ -40,6 +40,7 @@ sips -z 512 512   icon.png --out "$ICONSET/icon_256x256@2x.png" 2>/dev/null
 sips -z 512 512   icon.png --out "$ICONSET/icon_512x512.png"    2>/dev/null
 sips -z 1024 1024 icon.png --out "$ICONSET/icon_512x512@2x.png" 2>/dev/null
 ICNS="/tmp/macncheese_icon_$$.icns"
+trap 'rm -rf "$(dirname "$ICONSET")" "$ICNS"' EXIT
 iconutil -c icns "$ICONSET" -o "$ICNS"
 
 rm -rf "$APP"
