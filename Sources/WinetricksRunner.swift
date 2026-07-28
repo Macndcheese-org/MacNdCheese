@@ -20,11 +20,12 @@ final class WinetricksRunner: ObservableObject {
     /// until the job finishes. No-op while a run is already in flight or
     /// when there are no verbs.
     func run(verbs: [String], force: Bool = false, prefix: String, backend: BackendClient) async {
-        guard !isRunning, !verbs.isEmpty else { return }
+        let cleanVerbs = verbs.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+        guard !isRunning, !cleanVerbs.isEmpty else { return }
         reset()
         isRunning = true
 
-        guard let id = await backend.runWinetricks(prefix: prefix, verbs: verbs, force: force) else {
+        guard let id = await backend.runWinetricks(prefix: prefix, verbs: cleanVerbs, force: force) else {
             failed = true
             done = true
             isRunning = false
