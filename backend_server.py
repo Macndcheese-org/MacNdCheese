@@ -167,6 +167,7 @@ def _legendary_do_install(app_name: str, prefix: str) -> None:
             _legendary_cmd(prefix) + ["install", app_name,
              "--base-path", install_base,
              "-y", "--no-install-prereqs", "--skip-sdl"],
+            stdin=subprocess.DEVNULL,
             stdout=log_fh,
             stderr=subprocess.STDOUT,
             env=_legendary_env(prefix),
