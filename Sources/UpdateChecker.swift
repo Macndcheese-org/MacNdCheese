@@ -112,8 +112,12 @@ final class UpdateChecker: ObservableObject {
     }
 
     nonisolated private static func compareVersions(_ a: String, isNewerThan b: String) -> Bool {
-        let aParts = a.split(separator: ".").compactMap { Int($0) }
-        let bParts = b.split(separator: ".").compactMap { Int($0) }
+        let parsePart: (Substring) -> Int = { sub in
+            let digits = sub.prefix(while: \.isNumber)
+            return Int(digits) ?? 0
+        }
+        let aParts = a.split(separator: ".").map(parsePart)
+        let bParts = b.split(separator: ".").map(parsePart)
         let count = max(aParts.count, bParts.count)
         for i in 0..<count {
             let av = i < aParts.count ? aParts[i] : 0
