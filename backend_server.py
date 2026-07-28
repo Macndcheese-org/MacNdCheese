@@ -9010,16 +9010,14 @@ def cmd_legendary_launch_game(params: Dict[str, Any]) -> Any:
         bt = _unified_build_dir()
         _stage_unified_dlls(prefix_expanded)
         _stage_unified_mf(prefix_expanded)
-        # EA App's own helpers (Link2EA.exe, EADesktop.exe, ...) load d3d11.dll/dxgi.dll as a
-        # dependency even when they never render anything -- under plain D3DMetal that crashes
-        # immediately ("Failed to dlopen D3DMetal" assertion in shared.mm, live-confirmed on
-        # Link2EA.exe with kongbai's default_backend=d3dmetal3, which falls through to plain
-        # d3dmetal). EADesktop.exe itself is shielded from this via the loader's hardcoded
-        # steam_exes[] DXMT redirect, but Link2EA.exe and friends aren't in that list, so they'd
-        # otherwise inherit whatever MNC_GAME_BACKEND the bottle happens to default to. Force
-        # dxmt for the whole origin-launch regardless of bottle default -- matches the backend
-        # already proven working end-to-end for EA App's own CEF UI this session.
-        game_backend = "dxmt" if third_party_store else _unified_game_backend(bottle_cfg, backend)
+        # DEPRECATED 2026-07-28: this used to force dxmt for the whole third-party launch, so
+        # EA App's CEF processes wouldn't crash on D3DMetal. It also bound the GAME -- picking
+        # D3DMetal on Battlefield 4's card silently ran BF4 on DXMT, whose dxgi is the only one
+        # of our five builds missing the private DXGID3D10CreateDevice export wine's own d3d10
+        # calls, so BF4 aborted before its menu. The engine now scopes the DXMT redirect to CEF
+        # host processes itself (is_cef_host_process(), libcef.dll beside the exe), so the
+        # launcher gets DXMT and the game gets whatever the user actually chose.
+        game_backend = _unified_game_backend(bottle_cfg, backend)
         # Bradar a third-party-managed title (BF4 etc.) launches by handing a link2ea:// URI to
         # the EA App, so this launch IS a CEF launch even though the exe we invoke is `wine
         # start`. It needs the same CEF treatment the Applications section gets or EA App comes
@@ -9031,6 +9029,20 @@ def cmd_legendary_launch_game(params: Dict[str, Any]) -> Any:
         env = _unified_env(prefix_expanded, game_backend, metal_hud,
                             gst_debug=("5" if verbose_debug else "3"),
                             cef_safe_mode=bool(third_party_store))
+        # Bradar backend-specific env, same as _launch_game_unified does for Steam/manual
+        # launches. This path never had it, so an Epic game set to DXVK came up with
+        # "Required Vulkan extension VK_KHR_surface not supported" (no MoltenVK ICD wired) and
+        # a VR title got no OpenXR runtime at all -- both selectable from the game card, both
+        # broken only here. Kept in sync deliberately; see _launch_game_unified.
+        if game_backend == "vr":
+            _ensure_wineopenxr_registered(prefix_expanded)
+            env = _apply_monado_runtime_env(env)
+        if game_backend == "dxvk":
+            vk_icd = _find_moltenvk_icd()
+            if vk_icd:
+                env["VK_ICD_FILENAMES"] = vk_icd   # legacy vulkan-loader name
+                env["VK_DRIVER_FILES"] = vk_icd    # modern vulkan-loader name
+            env.setdefault("DXVK_STATE_CACHE", "0")
         # bt/wine, not bt/loader/wine -- the loader-style path can't find the build nls
         wine_bin = str(bt / "wine")
     else:
