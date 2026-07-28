@@ -255,7 +255,8 @@ def _nile_do_install(amazon_id: str, prefix: str) -> None:
                 entry[1].close()
             except Exception:
                 pass
-        _nile_games_cache.pop(prefix, None)
+        with _nile_cache_lock:
+            _nile_games_cache.pop(prefix, None)
 
 
 def _nile_queue_worker() -> None:
@@ -7899,31 +7900,29 @@ def _scan_nile_games(prefix: str) -> List[Dict[str, Any]]:
     if not _nile_installed():
         return []
 
-    entry = _nile_games_cache.get(prefix)
     now = time.time()
+    with _nile_cache_lock:
+        entry = _nile_games_cache.get(prefix)
+        if entry:
+            if not entry.get("scanning", False):
+                age = now - entry.get("ts", 0)
+                if age < _NILE_CACHE_TTL:
+                    return entry["games"]
+                entry["scanning"] = True
+                threading.Thread(target=_refresh_nile_cache, args=(prefix,), daemon=True).start()
+            return entry["games"]
 
-    if entry:
-        if not entry.get("scanning", False):
-            age = now - entry.get("ts", 0)
-            if age < _NILE_CACHE_TTL:
-                return entry["games"]  # fresh in-memory cache — instant
-            entry["scanning"] = True
-            threading.Thread(target=_refresh_nile_cache, args=(prefix,), daemon=True).start()
-        return entry["games"]  # return whatever we have while scanning
-
-    # No in-memory cache — try disk cache for an instant first response.
     owned_disk = _nile_read_disk_library(prefix)
-    if owned_disk:
-        games_fast = _nile_build_games_list(prefix, owned_disk)
-        _nile_games_cache[prefix] = {"games": games_fast, "ts": 0, "scanning": True}
-        threading.Thread(target=_refresh_nile_cache, args=(prefix,), daemon=True).start()
-        return games_fast
+    with _nile_cache_lock:
+        if owned_disk:
+            games_fast = _nile_build_games_list(prefix, owned_disk)
+            _nile_games_cache[prefix] = {"games": games_fast, "ts": 0, "scanning": True}
+            threading.Thread(target=_refresh_nile_cache, args=(prefix,), daemon=True).start()
+            return games_fast
 
-    # Truly cold start — nothing cached yet.
-    _nile_games_cache[prefix] = {"games": [], "ts": 0, "scanning": True}
-    threading.Thread(target=_refresh_nile_cache, args=(prefix,), daemon=True).start()
-    return []
-    return []
+        _nile_games_cache[prefix] = {"games": [], "ts": 0, "scanning": True}
+        threading.Thread(target=_refresh_nile_cache, args=(prefix,), daemon=True).start()
+        return []
 
 
 def cmd_legendary_status(_params: Dict[str, Any]) -> Any:
