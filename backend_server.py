@@ -2985,10 +2985,57 @@ def _d3dmetal_native_dir() -> Path:
     return D3DMETAL_NATIVE_DIR
 
 
+def _disable_shadowing_builtins() -> int:
+    """Move aside any wine builtin that shadows a backend-specific d3d DLL.
+
+    The loader rewrites a d3d module NAME (d3d10core.dll -> d3d10core_dxmt.dll) and then
+    resolves it -- but find_builtin_dll looks the builtin up by its ORIGINAL name, so if
+    wine still ships its own builtin for that module the builtin wins and the redirect is
+    silently defeated. The engine already had dxgi and d3d11 renamed aside by hand;
+    d3d10core was missed, so DXMT games got WINE's d3d10core, which imports
+    dxgi.DXGID3D10CreateDevice -- a symbol DXMT's dxgi (correctly) does not export. Wine
+    then stubs the import and terminates the process on the first D3D10 call:
+    "Call from ... to unimplemented function dxgi.dll.DXGID3D10CreateDevice, aborting".
+    Live-confirmed with a minimal D3D10CreateDevice probe: aborted before, returns S_OK
+    after, and the mapped image switches from wine's 159 KB builtin to DXMT's real 11 MB one.
+
+    The set is deliberately explicit rather than derived from the pack's filenames. It is
+    NOT "every module the pack ships a file for": the pack also ships canonical d3d10.dll,
+    d3d10_1.dll and d3d12.dll, and wine's d3d10 builtin in particular MUST stay -- it is the
+    public D3D10 API layer that calls D3D10CoreCreateDevice into the redirected d3d10core,
+    and there is no DXMT/DXVK d3d10 build to replace it with. Likewise wined3d and
+    winegstreamer only have per-backend variants (wined3d_opengl, winegstreamer_game) and
+    the loader falls back to wine's builtin for every other backend, so disabling those
+    breaks the fallback. Only these three are both redirected to a *_<backend>.dll target
+    AND have a canonical pack build to stand in for the builtin.
+
+    Idempotent, and x86_64 only -- the replacements are 64-bit builds, so a 32-bit process
+    must keep wine's builtins."""
+    d3d_dir = _unified_d3d_dir()
+    bt = _unified_build_dir()
+    if d3d_dir is None or bt is None:
+        return 0
+    moved = 0
+    for mod in ("dxgi", "d3d11", "d3d10core"):
+        if not (d3d_dir / f"{mod}.dll").exists():
+            continue    # no canonical replacement staged -> leave wine's builtin alone
+        builtin = bt / "dlls" / mod / "x86_64-windows" / f"{mod}.dll"
+        if not builtin.exists():
+            continue
+        try:
+            builtin.rename(builtin.with_suffix(".dll.builtin-disabled"))
+            log(f"unified: disabled wine builtin {mod}.dll so the backend redirect can win")
+            moved += 1
+        except Exception as exc:
+            log(f"unified: could not disable builtin {mod}.dll: {exc}")
+    return moved
+
+
 def _stage_unified_dlls(prefix: str) -> None:
     """Copy the unified d3d DLL slots into a prefix system32 so the loader has
     real targets to route to (canonical=DXMT plus *_d3dm and *_dxvk). Idempotent:
     only copies when the dest is missing or a different size."""
+    _disable_shadowing_builtins()
     src_dir = _unified_d3d_dir()
     if src_dir is None:
         log("unified: d3d DLL pack not found; backend routing may fail (run install_wine_unified)")
