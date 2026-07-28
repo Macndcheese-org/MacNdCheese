@@ -25,13 +25,15 @@ final class MacNCheeseURLHandler {
               let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
               let host = components.host else { return }
 
-        switch host {
+        switch host.lowercased() {
         case "launch":
             guard let bottlePath = components.queryValue("bottle"),
-                  let appid = components.queryValue("game") else { return }
+                  let appid = components.queryValue("game"),
+                  !bottlePath.isEmpty, !appid.isEmpty else { return }
             launch(bottlePath: bottlePath, appid: appid)
         case "bottle":
-            guard let bottlePath = components.queryValue("path") else { return }
+            guard let bottlePath = components.queryValue("path"),
+                  !bottlePath.isEmpty else { return }
             backend.selectBottle(bottlePath)
         default:
             break
