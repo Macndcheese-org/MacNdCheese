@@ -18,7 +18,8 @@ final class InstallRunner: ObservableObject {
     /// active prefix, streaming progress until the job finishes. No-op while a run
     /// is already in flight or when there are no actions.
     func run(actions: [String], backend: BackendClient) async {
-        guard !isRunning, !actions.isEmpty else { return }
+        let cleanActions = actions.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+        guard !isRunning, !cleanActions.isEmpty else { return }
         guard let installerPath = InstallerPathStore.installerScriptPath() else {
             reset()
             logLines = [L("installer.sh not found — reinstall MacNCheese.")]
@@ -35,7 +36,7 @@ final class InstallRunner: ObservableObject {
 
         guard let jobId = await backend.runInstaller(
             installerPath: installerPath,
-            actions: actions,
+            actions: cleanActions,
             prefix: prefix,
             dxvkSrc: p.dxvkSrc,
             dxvk64: p.dxvkInstall64,
