@@ -1261,8 +1261,16 @@ def _backend_wine_binary(backend: str, exe: str) -> Optional[str]:
         if wine_bin:
             log(f"Backend wine_devel using Wine Devel.app: {wine_bin} ({_get_wine_version(wine_bin)})")
             return wine_bin
-        log("Backend wine_devel selected but Wine Devel.app not installed "
-            "(Setup -> Wine Devel). Needed for OpenGL/SDL3 games like Mewgenics.")
+        # The OpenGL path is folded into the unified wine now (the _opengl DLL set +
+        # the macdrv GL 3.2 clamp, routed by MNC_GAME_BACKEND=opengl), so a missing
+        # standalone Wine Devel.app is normal -- fall through to unified insted of
+        # failing the launch outright like it used to.
+        unified = _find_wine()
+        if unified and _opengl_available():
+            log("Backend wine_devel -> unified wine (OpenGL folded in; no standalone app needed)")
+            return unified
+        log("Backend wine_devel selected but no OpenGL-capable wine found "
+            "(the unified wine's _opengl DLLs are missing -- re-run Setup).")
         return None
     return None
 
@@ -2793,6 +2801,39 @@ def _unified_d3d_dir() -> Optional[Path]:
     for d in (UNIFIED_D3D_DIR, UNIFIED_D3D_DEV):
         if (d / "d3d11.dll").exists():
             return d
+    return None
+
+
+def _opengl_available() -> bool:
+    """True when the OpenGL game backend can actualy run.
+
+    The OpenGL path used to be a SEPARATE "Wine Devel.app" download, so every
+    check keyed on _find_wine_devel(). It got folded INTO the unified wine (the
+    wined3d->OpenGL _opengl DLL set + the macdrv GL 3.2 clamp) and that app
+    stopped being installed -- but the checks were never repointed, so OpenGL
+    reported "not installed" on evry machine even with the DLLs sittin right
+    there. Key on the real capability (the _opengl slots in the unified d3d
+    pack) n keep the legacy app as a fallbak for older installs that have it."""
+    d3ddir = _unified_d3d_dir()
+    if d3ddir and (d3ddir / "d3d11_opengl.dll").exists() and (d3ddir / "wined3d_opengl.dll").exists():
+        return True
+    return _find_wine_devel() is not None
+
+
+def _unified_pe_builtin(name: str, arch_dir: str) -> Optional[Path]:
+    """Resolve one PE builtin inside the unified wine (build64 layout).
+
+    Unlike an installed wine (flat lib/wine/<arch>/) the unified tree keeps each
+    builtin under its own module dir: dlls/ntdll/x86_64-windows/ntdll.dll. Used to
+    diff a prefix against the wine that ACTUALY bootstrapped it."""
+    root = _unified_build_dir()
+    if not root:
+        return None
+    stem = name.rsplit(".", 1)[0]
+    for top in ("dlls", "programs"):
+        p = root / top / stem / arch_dir / name
+        if p.exists():
+            return p
     return None
 
 
@@ -5779,7 +5820,9 @@ def cmd_get_components_status(params: Dict[str, Any]) -> Any:
     has_dxvk32 = (dxvk32_install / "bin" / "d3d11.dll").exists()
     has_wine_stable = _find_wine_stable() is not None
     has_wine_staging = _find_wine_staging() is not None
-    has_wine_devel = _find_wine_devel() is not None
+    # OpenGL lives in the unified wine now, so report the capability, not the retired
+    # standalone app -- keying on the app made OpenGL read as missing everywhere.
+    has_wine_devel = _opengl_available()
     wine_version = _get_wine_version()
     return {
         "has_tools": has_tools,
@@ -5787,6 +5830,7 @@ def cmd_get_components_status(params: Dict[str, Any]) -> Any:
         "has_wine_stable": has_wine_stable,
         "has_wine_staging": has_wine_staging,
         "has_wine_devel": has_wine_devel,
+        "has_opengl": has_wine_devel,
         "has_mesa": _mesa_available(),
         "has_dxvk64": _dxvk_available(),
         "has_dxvk32": has_dxvk32,
@@ -6004,11 +6048,13 @@ def _stable_prefix_dll_sources() -> List[Dict[str, Any]]:
         {
             "arch": "x64",
             "wine_dir": stable_root / "x86_64-windows",
+            "unified_arch": "x86_64-windows",
             "prefix_dir": "drive_c/windows/system32",
         },
         {
             "arch": "x86",
             "wine_dir": stable_root / "i386-windows",
+            "unified_arch": "i386-windows",
             "prefix_dir": "drive_c/windows/syswow64",
         },
     ]
@@ -6022,12 +6068,20 @@ def _diagnose_stable_prefix_dlls(prefix: str, repairs: Dict[str, Dict[str, Any]]
     mismatched: List[str] = []
     checked = 0
 
+    # Compare each prefix against the wine that ACTUALY bootstrapped it. Prefixes are
+    # built by the UNIFIED wine now, whose builtins are legitimately different from Wine
+    # Stable's (unified ntdll is 4.6MB, stable's is 0.7MB) -- diffing them against Stable
+    # flagged evry single file as "mismatched" on a perfectly healthy prefix, and on a box
+    # with no Wine Stable installed it insted reported everything as missing. Prefer the
+    # unified builtin, fall back to Stable for prefixes that realy came from it.
+    unified_root = _unified_build_dir()
     for source in _stable_prefix_dll_sources():
         wine_dir: Path = source["wine_dir"]
         prefix_dir = prefix_path / source["prefix_dir"]
         arch = source["arch"]
+        unified_arch = source["unified_arch"]
 
-        if not wine_dir.is_dir():
+        if not wine_dir.is_dir() and not unified_root:
             source_missing.append(f"{arch}: {wine_dir}")
             continue
         if not prefix_dir.is_dir():
@@ -6038,7 +6092,7 @@ def _diagnose_stable_prefix_dlls(prefix: str, repairs: Dict[str, Dict[str, Any]]
         arch_missing = 0
         arch_mismatched = 0
         for name in PREFIX_DLL_VERIFY_FILES:
-            stable_file = wine_dir / name
+            stable_file = _unified_pe_builtin(name, unified_arch) or (wine_dir / name)
             prefix_file = prefix_dir / name
             if not stable_file.exists():
                 source_missing.append(f"{arch}: {name}")
@@ -6060,7 +6114,7 @@ def _diagnose_stable_prefix_dlls(prefix: str, repairs: Dict[str, Dict[str, Any]]
     details: List[str] = []
     details.extend(sections)
     if source_missing:
-        details.append("Missing in Wine Stable:")
+        details.append("Missing in the reference wine:")
         details.extend(f"  {item}" for item in source_missing[:16])
         if len(source_missing) > 16:
             details.append(f"  ... {len(source_missing) - 16} more")
