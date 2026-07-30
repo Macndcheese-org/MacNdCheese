@@ -2488,6 +2488,46 @@ stage_redist_pack() {
   [ -d "$rsrc/wine-mono" ] && cp -f "$rsrc/wine-mono/"*.msi "$rdst/wine-mono/" 2>/dev/null || true
   [ -d "$rsrc/corefonts" ] && cp -f "$rsrc/corefonts/"*.ttf "$rdst/corefonts/" 2>/dev/null || true
   echo "stage_redist_pack: staged redist pack from $rsrc ($(du -sh "$rdst" 2>/dev/null | cut -f1))"
+  stage_wine_addons "$rdst"
+}
+
+stage_wine_addons() {
+  # Put wine-gecko + wine-mono where wine's OWN on-demand installer looks (~/.cache/wine),
+  # so an install script that needs .NET or HTML can provision itself offline insted of
+  # failing. Wine asks for these EXACT versions (dlls/appwiz.cpl/addons.c) and ignores any
+  # other version, so the filenames matter -- note this mono is 10.4.1, NOT the 11.1.0 the
+  # redist pack ships for the launcher's own explicit install.
+  #
+  # Fetched rather than bundled on purpose: the three files are ~185 MB, which would push
+  # the disk image past GitHub's 2 GiB release-asset limit. A copy shipped next to us still
+  # wins when present (offline installs); download is the fallbak. Non-fatal either way --
+  # without them wine just prompts to download on first use, exactly like it does today.
+  local rdst cache gver mver f url src c
+  rdst="${1:-}"
+  cache="$HOME/.cache/wine"
+  gver="2.47.4"; mver="10.4.1"
+  mkdir -p "$cache" 2>/dev/null || return 0
+  for f in "wine-gecko-${gver}-x86.msi" "wine-gecko-${gver}-x86_64.msi" "wine-mono-${mver}-x86.msi"; do
+    [ -s "$cache/$f" ] && continue
+    src=""
+    for c in "${RESOURCES_DIR:-}/redist/addons/$f" "${rdst:-/nonexistent}/addons/$f" \
+             "/Volumes/ASAFE/D3DMETALWINEDEV/mnc-redist/addons/$f"; do
+      [ -s "$c" ] && { src="$c"; break; }
+    done
+    if [ -n "$src" ] && cp -f "$src" "$cache/$f" 2>/dev/null; then
+      echo "stage_wine_addons: $f (bundled)"; continue
+    fi
+    case "$f" in
+      wine-gecko-*) url="https://dl.winehq.org/wine/wine-gecko/${gver}/$f" ;;
+      *)            url="https://dl.winehq.org/wine/wine-mono/${mver}/$f" ;;
+    esac
+    if curl -sfL --max-time 900 -o "$cache/$f.part" "$url" 2>/dev/null; then
+      mv -f "$cache/$f.part" "$cache/$f" && echo "stage_wine_addons: $f (downloaded)"
+    else
+      rm -f "$cache/$f.part" 2>/dev/null
+      echo "stage_wine_addons: could not fetch $f (wine will prompt on first use)"
+    fi
+  done
 }
 
 uninstall_wine_unified() {
