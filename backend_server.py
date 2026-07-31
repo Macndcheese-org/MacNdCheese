@@ -4717,9 +4717,6 @@ def _launch_game_unified(prefix: str, exe: str, args: str, bottle_cfg: Dict[str,
     env = _unified_env(prefix, backend, metal_hud, gst_debug=("5" if debug else "3"),
                        needs_dotnet=needs_dotnet, cef_safe_mode=bool(params.get("force_dxmt_cef")),
                        debug=debug)
-    if _game_needs_dpi_aware(str(prefix), str(exe_path.parent), exe_path.name, "",
-                             bottle_cfg, params):
-        _apply_dpi_aware_regedit(wine, env, {exe_path.name})
     # Bradar VR: register the wineopenxr bridge as the prefixs active OpenXR runtime + force
     # our bundled x86_64 Monado runtime (an arm64 system one wont dlopen into the Rosetta wine)
     if backend == "vr":
@@ -4750,6 +4747,9 @@ def _launch_game_unified(prefix: str, exe: str, args: str, bottle_cfg: Dict[str,
     # the latter is the install-style loader and cannot find the build nls -> l_intl.nls fails
     wine = str(bt / "wine")
     _apply_retina_unified(bt, wine, env, params.get("retina_mode", bottle_cfg.get("retina_mode", False)))
+    if _game_needs_dpi_aware(str(prefix), str(exe_path.parent), exe_path.name, "",
+                             bottle_cfg, params):
+        _apply_dpi_aware_regedit(wine, env, {exe_path.name})
     if needs_dotnet:
         _apply_gecko_regedit(wine, env)   # mshtml is enabled above (needs_dotnet); give it a Gecko to render with
     safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", exe_path.stem)
@@ -9409,11 +9409,10 @@ def cmd_nile_launch_game(params: Dict[str, Any]) -> Any:
                             gst_debug=("5" if verbose_debug else "3"))
         # bt/wine, not bt/loader/wine -- the loader-style path can't find the build nls
         wine_bin = str(bt / "wine")
-        if _game_needs_dpi_aware(prefix_expanded, install_dir, exe_name, app_name,
-                                 bottle_cfg, params):
-            # A third-party title hands us no exe, so fall back to the known-title list --
-            # the registry key is matched on basename, which is all wine needs.
-            _apply_dpi_aware_regedit(wine_bin, env, {exe_name} if exe_name else _DPI_AWARE_EXES)
+        _amazon_exe = exe_path.name if exe_path else ""
+        if _amazon_exe and _game_needs_dpi_aware(prefix_expanded, install_dir,
+                                                 _amazon_exe, "", bottle_cfg, params):
+            _apply_dpi_aware_regedit(wine_bin, env, {_amazon_exe})
     else:
         # Classic fallback (unified wine not installed, or bottle engine="classic").
         # Resolve "auto"/"" the same way cmd_launch_game does (issue #105) instead of
