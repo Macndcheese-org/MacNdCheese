@@ -4818,6 +4818,18 @@ def _launch_game_unified(prefix: str, exe: str, args: str, bottle_cfg: Dict[str,
     steam_appid = str(params.get("steam_appid", "")).strip()
     if not steam_appid.isdigit():
         steam_appid = _derive_steam_appid(exe_dir) or ""
+    # The Rockstar launcher is a LAUNCHER, not a steamworks title: handing it an appid (via
+    # steam_appid.txt or SteamAppId) makes it take its steam-launched code path, call
+    # SteamAPI_Init and die with "Steam failed to initialize" when no client is up. It only
+    # needs those when STEAM itself started it -- and then steam supplys them, not us. A tile
+    # configured for RDR2 was leaking RDR2's 1174180 into the Launcher dir.
+    if steam_appid.isdigit() and _is_rockstar_launcher(params.get("exe", "")):
+        log("rockstar launcher: skipping steam appid (would force SteamAPI_Init)")
+        try:
+            (Path(exe_dir) / "steam_appid.txt").unlink()
+        except Exception:
+            pass
+        steam_appid = ""
     if steam_appid.isdigit():
         try:
             (Path(exe_dir) / "steam_appid.txt").write_text(steam_appid)
