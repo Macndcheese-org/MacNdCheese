@@ -2404,6 +2404,40 @@ uninstall_wine_installer() {
   echo "uninstall_wine_installer: removed"
 }
 
+relink_bundled_pack() {
+  # A Homebrew dylib records its dependencys as absolute /usr/local paths, so a pack copied
+  # straight out of the Cellar only loads on a machine that already HAS Homebrew -- which is
+  # precisely the machine that does not need the pack. Everything required is already sitting
+  # in the folder; it just is not referenced from there.
+  #
+  # That is what put a user on "Wine cannot find the FreeType font library" while our own boxes
+  # were fine: wine dlopen'd the bundled libfreetype, dyld could not resolve its
+  # /usr/local/opt/libpng dep, and the whole dlopen failed even though libpng16 was sat right
+  # next to it. mnc-tls happened to be built self-contained already; fonts/vulkan/sdl were not.
+  #
+  # So point every id and every Homebrew dep at @loader_path. Cellar copies come in read-only,
+  # hence the chmod, and install_name_tool invalidates the signature, hence the re-sign.
+  local dir f base dep
+  dir="$1"
+  [ -d "$dir" ] || return 0
+  for f in "$dir"/*.dylib; do
+    [ -e "$f" ] || continue
+    base="$(basename "$f")"
+    chmod u+w "$f" 2>/dev/null || true
+    install_name_tool -id "@loader_path/$base" "$f" 2>/dev/null || true
+    otool -L "$f" 2>/dev/null | tail -n +2 | awk '{print $1}' | while read -r dep; do
+      case "$dep" in
+        /usr/local/*|/opt/homebrew/*)
+          install_name_tool -change "$dep" "@loader_path/$(basename "$dep")" "$f" 2>/dev/null || true
+          ;;
+      esac
+    done
+    codesign --force --sign - "$f" >/dev/null 2>&1 || true
+  done
+  echo "relink_bundled_pack: $(basename "$dir") is now self-contained (@loader_path)"
+  return 0
+}
+
 stage_mnc_fonts() {
   # Bundled x86_64 freetype/fontconfig closure -> deps/mnc-fonts so the backend's DYLD_FALLBACK
   # resolves libfreetype on boxes WITHOUT Homebrew (else "Wine cannot find the FreeType font
@@ -2415,6 +2449,7 @@ stage_mnc_fonts() {
       rm -rf "$dst"; mkdir -p "$dst"
       cp -R "$src"/*.dylib "$dst"/ 2>/dev/null
       xattr -dr com.apple.quarantine "$dst" 2>/dev/null || true
+      relink_bundled_pack "$dst"
       echo "stage_mnc_fonts: staged $(ls "$dst"/*.dylib 2>/dev/null | wc -l | tr -d ' ') font libs -> deps/mnc-fonts"
       return 0
     fi
@@ -2436,6 +2471,7 @@ stage_mnc_tls() {
       rm -rf "$dst"; mkdir -p "$dst"
       cp -R "$src"/*.dylib "$dst"/ 2>/dev/null
       xattr -dr com.apple.quarantine "$dst" 2>/dev/null || true
+      relink_bundled_pack "$dst"
       echo "stage_mnc_tls: staged $(ls "$dst"/*.dylib 2>/dev/null | wc -l | tr -d ' ') TLS libs -> deps/mnc-tls"
       return 0
     fi
@@ -2457,6 +2493,7 @@ stage_mnc_vulkan() {
       rm -rf "$dst"; mkdir -p "$dst"
       cp -R "$src"/* "$dst"/ 2>/dev/null
       xattr -dr com.apple.quarantine "$dst" 2>/dev/null || true
+      relink_bundled_pack "$dst"
       echo "stage_mnc_vulkan: staged Vulkan loader + MoltenVK -> deps/mnc-vulkan"
       return 0
     fi
@@ -2476,6 +2513,7 @@ stage_mnc_sdl() {
       rm -rf "$dst"; mkdir -p "$dst"
       cp -R "$src"/* "$dst"/ 2>/dev/null
       xattr -dr com.apple.quarantine "$dst" 2>/dev/null || true
+      relink_bundled_pack "$dst"
       echo "stage_mnc_sdl: staged SDL2 -> deps/mnc-sdl"
       return 0
     fi

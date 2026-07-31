@@ -791,6 +791,11 @@ def _wine_env(prefix: str) -> Dict[str, str]:
         str(PORTABLE_DIR / "mnc-fonts"), str(PORTABLE_DIR / "mnc-tls"), str(PORTABLE_DIR / "mnc-vulkan"), str(PORTABLE_DIR / "mnc-sdl"),
         "/usr/lib",
     ])
+    # arch(1) purges every DYLD_* var on the way through, so a launch that wraps wine in arch
+    # hands it an empty search path and wine cant dlopen libfreetype -> "Wine cannot find the
+    # FreeType font library". Carry the same value under a name arch leaves alone so those
+    # paths can put it back on the far side of the boundary.
+    env["MNC_DYLD"] = env["DYLD_FALLBACK_LIBRARY_PATH"]
 
     return env
 
@@ -1291,6 +1296,7 @@ def _apply_backend_env(env: Dict[str, str], backend: str, debug: bool = False) -
             "/usr/local/opt/gnutls/lib", _WINE_STABLE_LIB,
             "/usr/lib",
         ])
+        env["MNC_DYLD"] = env["DYLD_FALLBACK_LIBRARY_PATH"]
         env["ROSETTA_ADVERTISE_AVX"] = "1"
         # SteamAppId is derived per-game (steam_appid.txt) in the launch-command
         # builder, not hardcoded here.
@@ -1528,10 +1534,18 @@ export WINEDEBUG={wine_debug}
         debug_prefix = (f"WINEDEBUG={WINE_DEBUG_VERBOSE},+wgl,+opengl" if debug
                         else "WINEDEBUG=+loaddll,+wgl,+opengl")
 
+    # Run a SHELL under arch and re-export DYLD inside it, rather than handing wine straight
+    # to arch -- arch strips DYLD_* crossing the boundary, which left wine with no way to find
+    # libfreetype and put users on "Wine cannot find the FreeType font library". The heredoc
+    # paths above already do this; this one was missed.
+    inner = (
+        'export DYLD_FALLBACK_LIBRARY_PATH="$MNC_DYLD"; '
+        f'export {debug_prefix}; '
+        f"exec {shlex.quote(wine)} {shlex.quote(exe_name)} {quoted_args}"
+    )
     return (
         f"cd {shlex.quote(exe_dir)} && "
-        f"{debug_prefix} arch -x86_64 {shlex.quote(wine)} "
-        f"{shlex.quote(exe_name)} {quoted_args} "
+        f"/usr/bin/arch -x86_64 /bin/bash -c {shlex.quote(inner)} "
         f"> {shlex.quote(log_path)} 2>&1"
     )
 
@@ -3587,6 +3601,7 @@ def _unified_env(prefix: str, game_backend: str, metal_hud: bool = False,
         "CX_APPLEGPTK_LIBD3DSHARED_PATH": libd3d,
         "FONTCONFIG_PATH": "/usr/local/opt/fontconfig/etc/fonts",
         "DYLD_FALLBACK_LIBRARY_PATH": dyld,
+        "MNC_DYLD": dyld,
         "WINEDLLOVERRIDES": dll_ovr,
         "MNC_STEAM_DXMT": "1",
         # Bradar skip the slow i386 Wow64Install during wineboot (10s vs 309s) and keep
@@ -5238,10 +5253,14 @@ def cmd_launch_steam(params: Dict[str, Any]) -> Any:
         exe_path = Path(launcher_exe)
         safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", exe_path.stem)
         log_path = str(LOG_DIR / f"{safe_name}-wine.log")
+        # same arch/DYLD trap as _backend_launch_cmd -- re-export inside the arch'd shell
+        _inner = (
+            'export DYLD_FALLBACK_LIBRARY_PATH="$MNC_DYLD"; '
+            f"exec {shlex.quote(wine)} {shlex.quote(str(exe_path))}"
+        )
         cmd = (
             f"cd {shlex.quote(str(exe_path.parent))} && "
-            f"arch -x86_64 {shlex.quote(wine)} "
-            f"{shlex.quote(str(exe_path))} "
+            f"/usr/bin/arch -x86_64 /bin/bash -c {shlex.quote(_inner)} "
             f"> {shlex.quote(log_path)} 2>&1"
         )
         proc = subprocess.Popen(
