@@ -4715,7 +4715,8 @@ def _launch_game_unified(prefix: str, exe: str, args: str, bottle_cfg: Dict[str,
     # when the process never really renders 3D -- just loading d3d11.dll/dxgi.dll as a dependency
     # is enough. DXMT doesn't have that failure mode, so force it for this whole launch class
     # regardless of the bottle's configured default_backend, same as EA App's own origin-launch.
-    if params.get("force_dxmt_cef"):
+    force_cef = bool(params.get("force_dxmt_cef")) or _is_cef_launcher(params.get("exe", ""))
+    if force_cef:
         backend = "dxmt"
     else:
         backend = _unified_game_backend(bottle_cfg, params.get("backend", ""))
@@ -4767,7 +4768,7 @@ def _launch_game_unified(prefix: str, exe: str, args: str, bottle_cfg: Dict[str,
             except Exception as exc:
                 log(f"unified: steam auto-launch failed: {exc} (continuing)")
     env = _unified_env(prefix, backend, metal_hud, gst_debug=("5" if debug else "3"),
-                       needs_dotnet=needs_dotnet, cef_safe_mode=bool(params.get("force_dxmt_cef")),
+                       needs_dotnet=needs_dotnet, cef_safe_mode=force_cef,
                        debug=debug)
     # Bradar VR: register the wineopenxr bridge as the prefixs active OpenXR runtime + force
     # our bundled x86_64 Monado runtime (an arm64 system one wont dlopen into the Rosetta wine)
@@ -4816,7 +4817,7 @@ def _launch_game_unified(prefix: str, exe: str, args: str, bottle_cfg: Dict[str,
     # means ANY Application/launcher gets it with no exe-name gating. Chromium forwards the
     # switches to its own children, so one delivery covers the whole tree. Never clobber a
     # user-supplied switch.
-    if params.get("force_dxmt_cef"):
+    if force_cef:
         _cef_argv = (env.get("MNC_WEBHELPER_FLAGS", "") + " "
                      + env.get("MNC_EA_WEBHELPER_EXTRA_FLAGS", "")).split()
         _have = {p.split("=", 1)[0] for p in (shlex.split(args) if args else []) if p.startswith("--")}
@@ -4841,6 +4842,41 @@ def _launch_game_unified(prefix: str, exe: str, args: str, bottle_cfg: Dict[str,
     _launched_games[(str(prefix), str(exe))] = proc.pid
     _running_games[proc.pid] = proc
     return {"pid": proc.pid, "log_path": log_path, "backend": backend, "engine": "unified"}
+
+
+# Launchers whos UI is CEF/Chromium: they must go down the same road Steam does (DXMT +
+# the GPU-spoof flag injection), no matter HOW the user started them. Plain D3DMetal kills
+# these the moment d3d11/dxgi is loaded as a dependency, even before anything renders
+# ("Failed to dlopen D3DMetal"), and without the CEF flags the GPU proc crash-loops into a
+# black window. force_dxmt_cef only ever got set by the Applications section, so the exact
+# same launcher started from the game grid quietly took the broken path -- hence match on
+# the exe too. Rockstar's Launcher.exe + SocialClubHelper.exe are the wine kernelbase hook's
+# other named target besides steamwebhelper, so the engine side is allready expecting them.
+_CEF_LAUNCHER_EXES = (
+    "launcher.exe",            # Rockstar Games Launcher
+    "socialclubhelper.exe",    # its CEF helper
+    "launcherpatcher.exe",
+    "eadesktop.exe",           # EA App
+    "link2ea.exe",
+    "epicgameslauncher.exe",
+)
+
+
+def _is_cef_launcher(exe: str) -> bool:
+    """True for launchers that must take the Steam-style CEF path.
+
+    Split on BOTH separators by hand: these are windows paths but we are running on macOS,
+    where Path() treats a backslash as an ordinary character, so Path(r"C:\\...\\Launcher.exe")
+    .name hands back the whole string and every match silently fails."""
+    raw = str(exe or "").replace("\\", "/")
+    name = raw.rsplit("/", 1)[-1].lower()
+    if name not in _CEF_LAUNCHER_EXES:
+        return False
+    # "Launcher.exe" is a common enough name that we only claim it for Rockstar's,
+    # which always sits under a Rockstar Games dir.
+    if name in ("launcher.exe", "launcherpatcher.exe"):
+        return "rockstar" in str(exe).lower()
+    return True
 
 
 def cmd_launch_game(params: Dict[str, Any]) -> Any:
