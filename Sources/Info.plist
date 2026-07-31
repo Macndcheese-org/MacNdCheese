@@ -2,133 +2,123 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>CFBundleExecutable</key>
-    <string>MacNCheese</string>
-    <key>CFBundleIdentifier</key>
-    <string>com.marcel.macncheese</string>
-    <key>CFBundleName</key>
-    <string>MacNdCheese Launcher</string>
-    <key>CFBundleDisplayName</key>
-    <string>MacNdCheese Launcher</string>
-    <key>CFBundleVersion</key>
-    <string>10.8.0</string>
-    <key>CFBundleShortVersionString</key>
-    <string>10.8.0</string>
-    <key>CFBundlePackageType</key>
-    <string>APPL</string>
-    <key>CFBundleIconFile</key>
-    <string>MacNCheese</string>
-    <key>CFBundleInfoDictionaryVersion</key>
-    <string>6.0</string>
-    <key>LSMinimumSystemVersion</key>
-    <string>12.0</string>
-    <key>NSHighResolutionCapable</key>
-    <true/>
-    <!-- macOS gates microphone access through TCC, which attributes a bare child process
-         (the unified Wine's loader/wine is a plain Mach-O, NOT an .app bundle) to the
-         responsible app that launched it -- us. Without this key that whole chain is
-         denied, and a denied CoreAudio capture call traps rather than returning an error:
-         wine's handle_syscall_fault turns it into STATUS_ILLEGAL_INSTRUCTION, and
-         mmdevapi's wine_unix_call() does assert(!status) -> raise(22), so the GAME
-         aborts itself the moment it opens a voice-chat capture stream (live-confirmed
-         with Battlefield 4). installer.sh's add_mic_usage_to_app() already injects this
-         into the Wine Stable/D3DMetal .app bundles, but the unified engine has no bundle
-         to patch, so declaring it here is what covers every engine. -->
-    <key>NSMicrophoneUsageDescription</key>
-    <string>MacNdCheese runs Windows games that use the microphone for in-game voice chat.</string>
-    <key>NSPrincipalClass</key>
-    <string>NSApplication</string>
-    <key>UTImportedTypeDeclarations</key>
-    <array>
-        <dict>
-            <key>UTTypeIdentifier</key>
-            <string>com.microsoft.windows-executable</string>
-            <key>UTTypeDescription</key>
-            <string>Windows Executable</string>
-            <key>UTTypeConformsTo</key>
-            <array>
-                <string>public.unix-executable</string>
-                <string>public.data</string>
-            </array>
-            <key>UTTypeTagSpecification</key>
-            <dict>
-                <key>public.filename-extension</key>
-                <array>
-                    <string>exe</string>
-                </array>
-                <key>public.mime-type</key>
-                <array>
-                    <string>application/x-msdownload</string>
-                </array>
-            </dict>
-        </dict>
-        <dict>
-            <key>UTTypeIdentifier</key>
-            <string>com.microsoft.windows-installer</string>
-            <key>UTTypeDescription</key>
-            <string>Windows Installer Package</string>
-            <key>UTTypeConformsTo</key>
-            <array>
-                <string>public.data</string>
-            </array>
-            <key>UTTypeTagSpecification</key>
-            <dict>
-                <key>public.filename-extension</key>
-                <array>
-                    <string>msi</string>
-                </array>
-                <key>public.mime-type</key>
-                <array>
-                    <string>application/x-msi</string>
-                </array>
-            </dict>
-        </dict>
-    </array>
-    <key>CFBundleDocumentTypes</key>
-    <array>
-        <dict>
-            <key>CFBundleTypeName</key>
-            <string>Windows Executable</string>
-            <key>CFBundleTypeRole</key>
-            <string>Viewer</string>
-            <key>LSHandlerRank</key>
-            <string>Alternate</string>
-            <key>LSItemContentTypes</key>
-            <array>
-                <string>com.microsoft.windows-executable</string>
-            </array>
-        </dict>
-        <dict>
-            <key>CFBundleTypeName</key>
-            <string>Windows Installer Package</string>
-            <key>CFBundleTypeRole</key>
-            <string>Viewer</string>
-            <key>LSHandlerRank</key>
-            <string>Alternate</string>
-            <key>LSItemContentTypes</key>
-            <array>
-                <string>com.microsoft.windows-installer</string>
-            </array>
-        </dict>
-    </array>
-    <key>NSSupportsAutomaticGraphicsSwitching</key>
-    <true/>
-    <key>LSApplicationCategoryType</key>
-    <string>public.app-category.games</string>
-    <key>CFBundleURLTypes</key>
-    <array>
-        <dict>
-            <key>CFBundleURLName</key>
-            <string>com.marcel.macncheese</string>
-            <key>CFBundleURLSchemes</key>
-            <array>
-                <string>macncheese</string>
-            </array>
-        </dict>
-    </array>
-    <key>NSUserActivityTypes</key>
-    <array>
-        <string>com.apple.corespotlight.search-continue-activity</string>
-    </array>
+	<key>CFBundleDisplayName</key>
+	<string>MacNdCheese Launcher</string>
+	<key>CFBundleDocumentTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>Windows Executable</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSHandlerRank</key>
+			<string>Alternate</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>com.microsoft.windows-executable</string>
+			</array>
+		</dict>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>Windows Installer Package</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSHandlerRank</key>
+			<string>Alternate</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>com.microsoft.windows-installer</string>
+			</array>
+		</dict>
+	</array>
+	<key>CFBundleExecutable</key>
+	<string>MacNCheese</string>
+	<key>CFBundleIconFile</key>
+	<string>MacNCheese</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.marcel.macncheese</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>MacNdCheese Launcher</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>10.8.1</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>com.marcel.macncheese</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>macncheese</string>
+			</array>
+		</dict>
+	</array>
+	<key>CFBundleVersion</key>
+	<string>10.8.1</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.games</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>12.0</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>MacNdCheese runs Windows games that use the microphone for in-game voice chat.</string>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
+	<key>NSSupportsAutomaticGraphicsSwitching</key>
+	<true/>
+	<key>NSUserActivityTypes</key>
+	<array>
+		<string>com.apple.corespotlight.search-continue-activity</string>
+	</array>
+	<key>UTImportedTypeDeclarations</key>
+	<array>
+		<dict>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>public.unix-executable</string>
+				<string>public.data</string>
+			</array>
+			<key>UTTypeDescription</key>
+			<string>Windows Executable</string>
+			<key>UTTypeIdentifier</key>
+			<string>com.microsoft.windows-executable</string>
+			<key>UTTypeTagSpecification</key>
+			<dict>
+				<key>public.filename-extension</key>
+				<array>
+					<string>exe</string>
+				</array>
+				<key>public.mime-type</key>
+				<array>
+					<string>application/x-msdownload</string>
+				</array>
+			</dict>
+		</dict>
+		<dict>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>public.data</string>
+			</array>
+			<key>UTTypeDescription</key>
+			<string>Windows Installer Package</string>
+			<key>UTTypeIdentifier</key>
+			<string>com.microsoft.windows-installer</string>
+			<key>UTTypeTagSpecification</key>
+			<dict>
+				<key>public.filename-extension</key>
+				<array>
+					<string>msi</string>
+				</array>
+				<key>public.mime-type</key>
+				<array>
+					<string>application/x-msi</string>
+				</array>
+			</dict>
+		</dict>
+	</array>
 </dict>
 </plist>
