@@ -2233,13 +2233,21 @@ locate_wine_unified_bundle() {
   script_path="$0"
   case "$script_path" in /*) ;; *) script_path="$PWD/$script_path" ;; esac
   script_dir="$(cd "$(dirname "$script_path")" 2>/dev/null && pwd)" || script_dir=""
+  # .tar.xz is what the engine repo publishes (and what the nightly bundles);
+  # .zip is the historical hand-made bundle. Both are accepted.
   candidates="
 ${WINE_UNIFIED_BUNDLE_PATH:-}
+${RESOURCES_DIR:-}/wine-unified-bundle.tar.xz
 ${RESOURCES_DIR:-}/wine-unified-bundle.zip
+${script_dir}/wine-unified-bundle.tar.xz
 ${script_dir}/wine-unified-bundle.zip
+${script_dir}/../Resources/wine-unified-bundle.tar.xz
 ${script_dir}/../Resources/wine-unified-bundle.zip
+${script_dir}/../../Resources/wine-unified-bundle.tar.xz
 ${script_dir}/../../Resources/wine-unified-bundle.zip
+$HOME/macndcheese/wine-unified-bundle.tar.xz
 $HOME/macndcheese/wine-unified-bundle.zip
+$HOME/Library/Application Support/MacNCheese/wine-unified-bundle.tar.xz
 $HOME/Library/Application Support/MacNCheese/wine-unified-bundle.zip
 "
   while IFS= read -r c; do
@@ -2250,7 +2258,7 @@ $candidates
 EOF
   for root in /Applications "$HOME/Applications" "$HOME/Downloads"; do
     [ -d "$root" ] || continue
-    found="$(find "$root" -maxdepth 5 -name 'wine-unified-bundle.zip' -type f 2>/dev/null | head -n1)"
+    found="$(find "$root" -maxdepth 5 \( -name 'wine-unified-bundle.tar.xz' -o -name 'wine-unified-bundle.zip' \) -type f 2>/dev/null | head -n1)"
     [ -n "$found" ] && [ -f "$found" ] && { printf '%s' "$found"; return 0; }
   done
   return 1
@@ -2309,16 +2317,32 @@ install_wine_unified() {
     echo "Using unified wine bundle: $bundle"
     rm -rf "$dst"
     mkdir -p "$dst"
-    if command -v unzip >/dev/null 2>&1; then
-      unzip -q "$bundle" -d "$dst" || { echo "Failed to unzip unified wine bundle"; exit 1; }
-    elif [ -x "$SEVENZ_BIN" ]; then
-      "$SEVENZ_BIN" x -y -o"$dst" "$bundle" >/dev/null || { echo "Failed to extract unified wine bundle"; exit 1; }
-    else
-      echo "Neither unzip nor 7z available to extract the bundle"; exit 1
-    fi
+    case "$bundle" in
+      *.tar.xz|*.txz)
+        # The tarball wraps everything in one top-level dir (wine-unified/), but
+        # $dst IS that dir -- strip a level or it ends up nested twice.
+        tar -xJf "$bundle" -C "$dst" --strip-components=1 \
+          || { echo "Failed to untar unified wine bundle"; exit 1; }
+        ;;
+      *)
+        if command -v unzip >/dev/null 2>&1; then
+          unzip -q "$bundle" -d "$dst" || { echo "Failed to unzip unified wine bundle"; exit 1; }
+        elif [ -x "$SEVENZ_BIN" ]; then
+          "$SEVENZ_BIN" x -y -o"$dst" "$bundle" >/dev/null || { echo "Failed to extract unified wine bundle"; exit 1; }
+        else
+          echo "Neither unzip nor 7z available to extract the bundle"; exit 1
+        fi
+        ;;
+    esac
     find "$dst" -name 'wine' -type f -exec chmod +x {} \; 2>/dev/null || true
     xattr -dr com.apple.quarantine "$dst" 2>/dev/null || true
-    stage_unified_d3d_pack "$dst"
+    # The engine bundle now ships mnc-d3d/ itself; only stage from Resources when
+    # it didn't (older hand-made .zip bundles).
+    if [ -f "$dst/mnc-d3d/d3d11.dll" ]; then
+      echo "install_wine_unified: d3d pack came with the bundle ($(ls "$dst/mnc-d3d" 2>/dev/null | wc -l | tr -d ' ') entries)"
+    else
+      stage_unified_d3d_pack "$dst"
+    fi
     stage_redist_pack
     sign_unified_wine "$dst"
     echo "install_wine_unified: done ($(du -sh "$dst" 2>/dev/null | cut -f1))"
