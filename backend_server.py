@@ -4788,6 +4788,17 @@ def _launch_game_unified(prefix: str, exe: str, args: str, bottle_cfg: Dict[str,
     env = _unified_env(prefix, backend, metal_hud, gst_debug=("5" if debug else "3"),
                        needs_dotnet=needs_dotnet, cef_safe_mode=force_cef,
                        debug=debug)
+    # Rockstar: make d3d12 cleanly ABSENT. The Social Club CEF resolves D3D12CreateDevice
+    # dynamicaly and calls it through an UNGUARDED proc-table slot -- with our half-alive
+    # d3d12 stub loaded the slot ends up NULL and every helper dies calling address 0
+    # (proven from the crashpad minidumps: call site libcef+0x4c984d3, rax=0, args =
+    # (adapter, FL_11_0, IID_ID3D12Device, &out)). With the dll disabled the LoadLibrary
+    # fails and CEF takes its guarded no-d3d12 path insted -> browser lives, UI paints.
+    # Also quiets RGL's own caught "[dx12] Exception thrown during DX12 GPU query".
+    # Scoped to Rockstar launches only: D3DMetal d3d12 games must keep ther d3d12.
+    if _is_rockstar_launcher(params.get("exe", "")):
+        env["WINEDLLOVERRIDES"] = env.get("WINEDLLOVERRIDES", "") + ";d3d12,d3d12core=d"
+        log("rockstar launcher: d3d12 disabled (CEF NULL D3D12CreateDevice crash)")
     # Bradar VR: register the wineopenxr bridge as the prefixs active OpenXR runtime + force
     # our bundled x86_64 Monado runtime (an arm64 system one wont dlopen into the Rosetta wine)
     if backend == "vr":
@@ -4877,11 +4888,13 @@ def _launch_game_unified(prefix: str, exe: str, args: str, bottle_cfg: Dict[str,
 #               RGL reaches its own init. (The "failed to initialize" past this point is
 #               the separate wine-SCM frontier, not a graphics problem.)
 _CEF_LAUNCHER_BACKENDS = {
-    "socialclubhelper.exe":        "dxvk",      # Rockstar CEF helper
-    "launcher.exe":                "dxvk",      # Rockstar Games Launcher (dir-checked below)
-    "launcherpatcher.exe":         "dxvk",
-    "rockstar-games-launcher.exe": "dxvk",      # the installer
-    "playrdr2.exe":                "dxvk",
+    # Rockstar is back on DXMT: its D2D UI needed IDXGISurface1/GetDC + SwapDeviceContextState,
+    # both now in the bundled DXMT (d3d11_dxmt 21511438+). Pair with the d3d12 block below.
+    "socialclubhelper.exe":        "dxmt",      # Rockstar CEF helper
+    "launcher.exe":                "dxmt",      # Rockstar Games Launcher (dir-checked below)
+    "launcherpatcher.exe":         "dxmt",
+    "rockstar-games-launcher.exe": "dxmt",      # the installer
+    "playrdr2.exe":                "dxmt",
     "eadesktop.exe":               "dxmt",      # EA App
     "link2ea.exe":                 "dxmt",
 }
@@ -4907,6 +4920,12 @@ def _cef_launcher_backend(exe: str) -> Optional[str]:
 
 def _is_cef_launcher(exe: str) -> bool:
     return _cef_launcher_backend(exe) is not None
+
+
+def _is_rockstar_launcher(exe: str) -> bool:
+    raw = str(exe or "").replace("\\", "/").lower()
+    name = raw.rsplit("/", 1)[-1]
+    return "rockstar" in raw or name in ("socialclubhelper.exe", "playrdr2.exe")
 
 
 def cmd_launch_game(params: Dict[str, Any]) -> Any:
