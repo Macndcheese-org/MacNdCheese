@@ -9274,8 +9274,34 @@ def _ensure_cli_on_path() -> None:
         log(f"Could not link the CLI onto PATH: {exc}")
 
 
+def _app_version() -> str:
+    """Our own CFBundleShortVersionString for the startup banner.
+
+    backend_server.py ships at <App>.app/Contents/Resources/, so the plist is one dir up.
+    Worth the few lines: bug reports used to arrive as a pile of logs with NO way to tell
+    which build produced them, so triage started by guessing the version -- and a report
+    from a months-old build looks exactly like a fresh regression."""
+    plist = Path(__file__).resolve().parent.parent / "Info.plist"
+    try:
+        out = subprocess.run(["/usr/libexec/PlistBuddy", "-c",
+                              "Print :CFBundleShortVersionString", str(plist)],
+                             capture_output=True, text=True, timeout=5)
+        if (v := (out.stdout or "").strip()):
+            return v
+    except Exception:
+        pass
+    return "unknown (not running from an app bundle?)"
+
+
 def main() -> None:
-    log("MacNCheese backend server started")
+    # Version + engine layout FIRST. The rest of this log is near-useless for triage without
+    # knowing which build wrote it and whether the unified wine is even installed: a
+    # pre-unified install has none of the Steam/DXMT/TLS wiring and so fails in ways that
+    # look like brand-new bugs.
+    _uni = _unified_build_dir()
+    log(f"MacNCheese backend server started -- app {_app_version()}")
+    log(f"unified wine = {_uni if _uni else 'NOT INSTALLED (old pre-unified layout; run Setup)'}")
+    log(f"mnc-tls      = {'present' if (PORTABLE_DIR / 'mnc-tls' / 'libgnutls.30.dylib').exists() else 'MISSING (Steam login can fail on a mac with no Homebrew)'}")
     log(f"PORTABLE_DIR = {PORTABLE_DIR}")
     log(f"BOTTLES_BASE = {BOTTLES_BASE}")
     log(f"DEFAULT_PREFIX = {DEFAULT_PREFIX}")
