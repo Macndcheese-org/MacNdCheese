@@ -2623,7 +2623,23 @@ case "$ACTION" in
     uninstall_wine_installer
     ;;
   stage_mnc_fonts)
+    # Stages ALL the bundled x86_64 libs wine dlopens by bare soname, not just fonts.
+    # Onboarding (the only fresh-box path) and the wine version gate both request this
+    # single action, so anything not called here never reaches a new install -- which is
+    # exactly how the TLS/Vulkan/SDL packs would have shipped unreachable.
     stage_mnc_fonts
+    stage_mnc_tls
+    stage_mnc_vulkan
+    stage_mnc_sdl
+    ;;
+  stage_mnc_tls)
+    stage_mnc_tls
+    ;;
+  stage_mnc_vulkan)
+    stage_mnc_vulkan
+    ;;
+  stage_mnc_sdl)
+    stage_mnc_sdl
     ;;
   uninstall_wine)
     uninstall_wine

@@ -399,7 +399,10 @@ struct OnboardingView: View {
         func add(_ installed: Bool, _ action: String) { if !installed { actions.append(action) } }
         let s = status
         add(s?.hasTools ?? false, "install_tools")
-        add(s?.hasWineStable ?? false, "install_wine")
+        // Wine Unified is THE engine now. The old standalone Wine Stable is legacy: nothing
+        // on a fresh box needs it (the 32-bit installer path uses the pre-HACK22 overlay
+        // built by install_wine_installer, and the gnutls it used to supply is bundled as
+        // mnc-tls), so it is opt-in via "install everything" insted of a default download.
         add(s?.hasWineUnified ?? false, "install_wine_unified")
         // build the pre-HACK22 installer overlay + stage the bundled freetype whenever we set up the
         // unified wine (fresh box). without the overlay, 32-bit installers (SteamSetup / vc_redist /
@@ -411,6 +414,7 @@ struct OnboardingView: View {
         add(s?.hasWineUnified ?? false, "install_wine_installer")
         add(s?.hasWineUnified ?? false, "stage_mnc_fonts")
         if installEverything {
+            add(s?.hasWineStable ?? false, "install_wine")
             add(s?.hasWineStaging ?? false, "install_wine_staging")
         }
         add(s?.hasDxvk64 ?? false, "install_dxvk")

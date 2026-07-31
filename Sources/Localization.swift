@@ -558,6 +558,11 @@ enum Localization {
         "This overwrites d3d11, dxgi and d3d10core in this bottle — the same files MacNdCheese sets up for Steam and for game rendering. Steam or your games may stop rendering until the bottle is set up again.": "这会覆盖此容器中的 d3d11、dxgi 和 d3d10core——正是 MacNdCheese 为 Steam 和游戏渲染所配置的文件。在重新配置此容器之前，Steam 或你的游戏可能无法渲染。",
         "Unreachable": "无法访问",
         "MacNCheese Stats & Showcase": "MacNCheese 统计与精选",
+        "Wine Unified — Steam + games engine (recommended)": "Wine Unified——Steam 与游戏引擎（推荐）",
+        "Wine (Stable) — legacy (not recommended)": "Wine（Stable）——旧版（不推荐）",
+        "The engine MacNdCheese actually runs on. One patched Wine 11.0 that renders Steam via DXMT and routes games to the chosen backend (D3DMetal/DXMT/DXVK). Bundled with the app, installs offline.": "MacNdCheese 实际运行所用的引擎。一个打过补丁的 Wine 11.0，通过 DXMT 渲染 Steam，并将游戏路由到所选后端（D3DMetal/DXMT/DXVK）。随应用捆绑，可离线安装。",
+        "The old standalone Wine. Superseded by Wine Unified and no longer installed by default. Kept only for older bottles that still point at it.": "旧的独立 Wine。已被 Wine Unified 取代，默认不再安装。仅为仍指向它的旧容器保留。",
+        "Select: Tools, Wine Unified, DXVK": "选择：工具、Wine Unified、DXVK",
     ]
 }
 

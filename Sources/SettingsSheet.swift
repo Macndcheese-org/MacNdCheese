@@ -559,11 +559,11 @@ struct SetupSettingsTab: View {
                 GroupBox(L("Quick Setup")) {
                     HStack(spacing: 12) {
                         Button(L("Minimal")) {
-                            wantTools = true; wantWineStable = true; wantWineUnified = true
+                            wantTools = true; wantWineUnified = true
                             wantDxvk = true
                         }
                         .buttonStyle(.bordered)
-                        .help(L("Select: Tools, Wine Stable, Wine Unified, DXVK"))
+                        .help(L("Select: Tools, Wine Unified, DXVK"))
                         .disabled(isRunning)
                         Button(L("Everything")) {
                             wantTools = true; wantWineStable = true; wantWineStaging = true
@@ -595,9 +595,10 @@ struct SetupSettingsTab: View {
 
                 GroupBox(L("Wine (Translation Engine)")) {
                     VStack(alignment: .leading, spacing: 8) {
-                        ComponentToggleRow(L("Wine (Stable)"), isOn: $wantWineStable,
-                                          installed: hadWineStable, updateAvailable: wineStableHasUpdate)
+                        ComponentToggleRow(L("Wine Unified — Steam + games engine (recommended)"),
+                                          isOn: $wantWineUnified, installed: hadWineUnified)
                             .disabled(isRunning)
+                            .help(L("The engine MacNdCheese actually runs on. One patched Wine 11.0 that renders Steam via DXMT and routes games to the chosen backend (D3DMetal/DXMT/DXVK). Bundled with the app, installs offline."))
                         ComponentToggleRow(stagingLatestName.map { String(format: L("Wine (Staging — %@)"), $0) } ?? L("Wine (Staging)"),
                                           isOn: $wantWineStaging,
                                           installed: hadWineStaging, updateAvailable: wineStagingHasUpdate)
@@ -607,6 +608,10 @@ struct SetupSettingsTab: View {
                                           installed: hadWineDevel)
                             .disabled(isRunning)
                             .help(L("Standalone Wine Staging 11.8 with the OpenGL 3.2+ macdrv patch, for SDL3/OpenGL games (e.g. Mewgenics). Downloaded on install. Independent build."))
+                        ComponentToggleRow(L("Wine (Stable) — legacy (not recommended)"), isOn: $wantWineStable,
+                                          installed: hadWineStable, updateAvailable: wineStableHasUpdate)
+                            .disabled(isRunning)
+                            .help(L("The old standalone Wine. Superseded by Wine Unified and no longer installed by default. Kept only for older bottles that still point at it."))
                     }
                     .padding(8)
                 }
@@ -620,10 +625,6 @@ struct SetupSettingsTab: View {
                             .disabled(isRunning)
                         ComponentToggleRow(L("VKD3D-Proton"), isOn: $wantVkd3d, installed: hadVkd3d)
                             .disabled(isRunning)
-                        ComponentToggleRow(L("Wine Unified (Steam + games engine)"),
-                                          isOn: $wantWineUnified, installed: hadWineUnified)
-                            .disabled(isRunning)
-                            .help(L("One patched Wine 11.0 that renders Steam via DXMT and routes games to the chosen backend (D3DMetal/DXMT/DXVK). This is the default engine. Bundled with the app; installs into deps."))
                     }
                     .padding(8)
                 }
