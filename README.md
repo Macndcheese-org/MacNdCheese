@@ -81,6 +81,19 @@ No not at all its a one of its own architectures and is completely different ste
 - DirectX 9 games (Most likely to run on DXMT but mostly no)
 - Games with kernel-level anti-cheat (EAC, BattlEye, Vanguard) — these will **not** work
 
+### I own an EA game on Epic (Battlefield 4, skate., …) and Install does nothing
+Epic lists some EA titles but doesn't actually host them — they're fulfilled through **the EA
+app**, so there is nothing for Epic to download. MacNCheese now detects these (they show an
+"EA App" badge and a **Set Up via EA App** button instead of Install) and, the first time you
+use one, offers to install the EA app into that bottle for you. It downloads
+`EAappInstaller.exe` straight from EA's official release URL
+(`origin-a.akamaihd.net/EA-Desktop-Client-Download/...`) — nothing happens until you ask for
+it, and you sign in to EA yourself. After that the title launches by handing off to the EA app,
+where you install and play it.
+
+The EA app also shows up in a bottle's **Applications** section once installed, so you can open
+it on its own.
+
 ### Why don't anti-cheat games work?
 Anti-cheat software like Easy Anti-Cheat and BattlEye require deep Windows system access that wine can't provide. For few cases this is indeed a macndcheese issiue but games like marvel rivals do not work due to anticheat on every wine wrapper
 

@@ -72,6 +72,7 @@ PREFIXES_JSON = Path.home() / ".macncheese_prefixes.json"
 BOTTLES_JSON = Path.home() / ".macncheese_bottles.json"
 
 STEAM_SETUP_URL = "https://cdn.fastly.steamstatic.com/client/installer/SteamSetup.exe"
+EA_APP_SETUP_URL = "https://origin-a.akamaihd.net/EA-Desktop-Client-Download/installer-releases/EAappInstaller.exe"
 
 LEGENDARY_DIR = PORTABLE_DIR / "legendary"
 LEGENDARY_BIN = LEGENDARY_DIR / "legendary"
@@ -132,8 +133,24 @@ APPMANIFEST_RE = re.compile(r'"(\w+)"\s+"([^"]*)"')
 _legendary_installing: bool = False
 _legendary_installs: Dict[str, Any] = {}  # app_name -> (Popen, file, log_path, prefix)
 _legendary_paused: Dict[str, str] = {}    # app_name -> prefix (paused downloads)
+_legendary_failed: Dict[str, Dict[str, Any]] = {}  # app_name -> {"error": str, "prefix": str}
 _legendary_games_cache: Dict[str, Any] = {}  # prefix -> {"games": [], "ts": float, "scanning": bool}
 _LEGENDARY_CACHE_TTL = 300  # seconds before a background re-fetch is triggered
+
+
+def _scan_legendary_log_for_error(log_path: str, tail: int = 30) -> Optional[str]:
+    """Scans the tail of a legendary log for an error line, regardless of
+    the process's return code -- some failures (e.g. a third-party-managed
+    title) exit 0 despite printing a `[cli] ERROR: ...` line."""
+    try:
+        with open(log_path, "r") as f:
+            lines = f.readlines()
+        for line in reversed(lines[-tail:]):
+            if "error" in line.lower() or "failed" in line.lower():
+                return line.strip()
+    except Exception:
+        pass
+    return None
 
 # Download queue — one install runs at a time, others wait.
 _legendary_download_queue: List[Tuple[str, str]] = []  # [(app_name, prefix)]
@@ -160,11 +177,13 @@ atexit.register(_terminate_legendary_installs)
 
 def _legendary_do_install(app_name: str, prefix: str) -> None:
     """Run one legendary install to completion. Called from the queue worker thread."""
+    _legendary_failed.pop(app_name, None)  # clear any stale failure from a prior attempt
     install_base = str(
         Path(prefix).expanduser().resolve() / "drive_c" / "Program Files" / "Epic Games"
     )
     Path(install_base).mkdir(parents=True, exist_ok=True)
     log_path = str(LEGENDARY_DIR / f"install_{app_name}.log")
+    proc = None
     try:
         log_fh = open(log_path, "w")
         proc = subprocess.Popen(
@@ -187,6 +206,15 @@ def _legendary_do_install(app_name: str, prefix: str) -> None:
                 entry[1].close()
             except Exception:
                 pass
+        # legendary can exit 0 while having done nothing (e.g. a title that
+        # has to be installed via a third-party store) -- scan the log
+        # regardless of return code rather than trusting the exit status.
+        err = _scan_legendary_log_for_error(log_path)
+        if err or (proc is not None and proc.returncode not in (0, None)):
+            _legendary_failed[app_name] = {
+                "error": err or f"legendary exited with code {proc.returncode}",
+                "prefix": prefix,
+            }
         _legendary_games_cache.pop(prefix, None)
 
 
@@ -767,6 +795,39 @@ def _wine_env(prefix: str) -> Dict[str, str]:
     return env
 
 
+def _apply_dpi_aware_regedit(wine: str, env: dict, exes: set) -> None:
+    r"""Mark executables DPI-aware using wine's OWN app-compat mechanism.
+
+    HKCU\...\AppCompatFlags\Layers keyed by the lowercased exe BASENAME is the same
+    knob Windows exposes for forcing a legacy app HiDPI-aware, and win32u applies it at
+    startup (sysparams.c, "HIGHDPIAWARE") -- crucially BEFORE any window exists, so the
+    windows are created aware and every geometry API agrees from the outset.
+
+    This is why nothing has to be patched into wine: with Retina Mode on, wine reports the
+    display-mode list in physical pixels but monitor rects and mouse input in logical ones,
+    and a fullscreen game caught between the two mis-places the cursor and can end up with
+    a black window. Marking it aware makes both answers physical.
+
+    An embedded manifest that simply omits dpiAware (Battlefield 4 ships exactly that)
+    cannot be overridden with an external manifest, since wine prefers the embedded one --
+    the registry layer is the supported way in."""
+    if not exes:
+        return
+    lines = ["REGEDIT4", "",
+             "[HKEY_CURRENT_USER\\Software\\Microsoft\\Windows NT\\CurrentVersion"
+             "\\AppCompatFlags\\Layers]"]
+    for exe in sorted(exes):
+        lines.append(f'"{exe.lower()}"="HIGHDPIAWARE"')
+    try:
+        reg_file = Path(tempfile.gettempdir()) / "wine_dpi_aware.reg"
+        reg_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        subprocess.run([wine, "regedit", str(reg_file)], env=env, timeout=300,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        log(f"Applied regedit: HIGHDPIAWARE for {sorted(exes)}")
+    except Exception as exc:
+        log(f"dpi-aware regedit failed: {exc}")
+
+
 def _apply_retina_regedit(wine: str, env: dict, retina_mode: bool) -> None:
     """Apply RetinaMode, Resolution and LogPixels via `wine regedit file.reg`."""
     retina_val = "y" if retina_mode else "n"
@@ -798,6 +859,47 @@ def _apply_retina_regedit(wine: str, env: dict, retina_mode: bool) -> None:
         log(f"Applied regedit: RetinaMode={retina_val}, Resolution=auto, LogPixels=000000{dpi_hex} ({int(dpi_hex, 16)} DPI)")
     except Exception as exc:
         log(f"Warning: regedit failed: {exc}")
+
+
+def _apply_gecko_regedit(wine: str, env: dict) -> None:
+    """Point mshtml.dll at Wine Gecko so embedded-HTML/COM rendering (EULA text, WiX Burn's own
+    bootstrapper chrome, any embedded browser control) actually works, for any launch where
+    _unified_env() left mshtml enabled (needs_dotnet=True -- see _unified_env's dll_ovr). Our
+    unified engine ships no Gecko package of its own (unlike Wine Stable/D3DMetal), so builtin
+    mshtml.dll loads but can't render anything without this. Sourced from the SAME self-contained
+    redist pack that already provisions wine-mono/d3dcompiler_47 for the unified engine (deps/
+    redist/wine-gecko/) -- deliberately NOT Wine Stable.app: unified wine is meant to eventually
+    replace Wine Stable outright, so it can't depend on it still being installed. Sets BOTH the
+    plain and Wow6432Node views since a 32-bit process's HKLM\\Software\\Wine view is WOW64-
+    redirected to Wow6432Node. Confirmed live against EA App's installer."""
+    src = _redist_dir()
+    gecko_dir = (src / "wine-gecko") if src else None
+    x64 = gecko_dir / "wine-gecko-2.47.4-x86_64" if gecko_dir else None
+    x86 = gecko_dir / "wine-gecko-2.47.4-x86" if gecko_dir else None
+    if not x64 or not x64.is_dir() or not x86.is_dir():
+        log("gecko: redist wine-gecko pack not bundled (deps/redist/wine-gecko) -- embedded HTML/CEF UIs may not render")
+        return
+
+    def _win_path(p: Path) -> str:
+        # macOS abs path -> wine's Z: drive mapping; each '/' becomes a doubled '\\' in one
+        # step since REGEDIT4 string values need every backslash escaped.
+        return "Z:" + str(p).replace("/", "\\\\")
+
+    reg_content = (
+        "REGEDIT4\n\n"
+        "[HKEY_LOCAL_MACHINE\\Software\\Wine\\MSHTML\\2.47.4]\n"
+        f'"GeckoPath"="{_win_path(x64)}"\n\n'
+        "[HKEY_LOCAL_MACHINE\\Software\\Wow6432Node\\Wine\\MSHTML\\2.47.4]\n"
+        f'"GeckoPath"="{_win_path(x86)}"\n'
+    )
+    try:
+        reg_file = Path(tempfile.gettempdir()) / "wine_gecko.reg"
+        reg_file.write_text(reg_content, encoding="utf-8")
+        subprocess.run([wine, "regedit", str(reg_file)], env=env, timeout=300,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        log("Applied regedit: mshtml GeckoPath -> redist wine-gecko 2.47.4")
+    except Exception as exc:
+        log(f"Warning: gecko regedit failed: {exc}")
 
 
 
@@ -1072,7 +1174,9 @@ def _resolve_auto_backend(exe_path: Optional[str] = None) -> str:
 # exception diagnostics through — exactly what the default "-all" suppresses
 # (DLL load failures, unresolved imports, crashes). This is what would have made
 # the SDL3.dll + UE4 crash diagnoses instant.
-WINE_DEBUG_VERBOSE = "+loaddll,+module,+seh"
+# Set MNC_WINEDEBUG to override this for a session (e.g. "+seh,+coreaudio,+mmdevapi" when
+# chasing an audio abort) without editing code.
+WINE_DEBUG_VERBOSE = os.environ.get("MNC_WINEDEBUG", "+loaddll,+module,+seh")
 
 
 def _apply_backend_env(env: Dict[str, str], backend: str, debug: bool = False) -> Dict[str, str]:
@@ -1848,6 +1952,87 @@ def _unpatch_dxvk(game_dir: Path) -> None:
 # Steam library / game scanning helpers
 # ---------------------------------------------------------------------------
 
+# --- wine reparse points (Windows symlinks / directory junctions) ------------
+#
+# Wine does NOT store a Windows symlink/junction as a unix symlink. It stores it as an
+# EMPTY DIRECTORY carrying a `user.WINEREPARSE` xattr (the raw REPARSE_DATA_BUFFER) and
+# appends ONE '?' to the UNIX name -- '?' is illegal in a Windows filename so it can never
+# collide with a real file, and ntdll strips exactly one trailing '?' off every directory
+# entry on the way back to Windows (dlls/ntdll/unix/file.c, append_entry()). So a path
+# that opens perfectly INSIDE the bottle can look missing from Python: EA App's own
+# installer creates C:\...\EA Desktop\EA Desktop -> 13.754.0.6267\EA Desktop, which lands
+# on disk as a directory literally named "EA Desktop?" -- every Start Menu shortcut
+# through it failed Path.exists(), so EA App was silently dropped from the Apps section.
+# Resolve THROUGH the reparse point (read its target) rather than just tolerating the '?'
+# in the name: the path we hand back is then real on BOTH sides, so wine gets something it
+# can open and exe_dir / DLL staging / icon lookup keep working unchanged. Generic -- any
+# bottle, any app that creates a junction, no per-app knowledge.
+WINE_REPARSE_XATTR = "user.WINEREPARSE"
+_IO_REPARSE_TAG_SYMLINK = 0xA000000C
+_IO_REPARSE_TAG_MOUNT_POINT = 0xA0000003
+
+
+def _wine_reparse_target(link: Path, prefix: Path) -> Optional[Path]:
+    """Follow ONE wine reparse point to the host path it points at (None if it isn't one)."""
+    try:
+        out = subprocess.run(["xattr", "-px", WINE_REPARSE_XATTR, str(link)],
+                             capture_output=True, text=True, timeout=5)
+        if out.returncode != 0 or not out.stdout.strip():
+            return None
+        buf = bytes.fromhex("".join(out.stdout.split()))
+        tag = struct.unpack_from("<I", buf, 0)[0]
+        if tag == _IO_REPARSE_TAG_SYMLINK:
+            off, length, _po, _pl, flags = struct.unpack_from("<HHHHI", buf, 8)
+            base, relative = 20, bool(flags & 1)          # SYMLINK_FLAG_RELATIVE
+        elif tag == _IO_REPARSE_TAG_MOUNT_POINT:
+            off, length = struct.unpack_from("<HH", buf, 8)
+            base, relative = 16, False
+        else:
+            return None
+        target = buf[base + off:base + off + length].decode("utf-16-le", "ignore").rstrip("\x00")
+    except Exception:
+        return None
+    if not target:
+        return None
+    if relative:
+        return link.parent / target.replace("\\", "/")
+    if target.startswith("\\??\\"):                        # NT form: \??\C:\...
+        target = target[4:]
+    if len(target) > 2 and target[1] == ":":
+        return prefix / f"drive_{target[0].lower()}" / target[3:].replace("\\", "/")
+    return None
+
+
+def _resolve_wine_path(prefix: Path, path: Path, _depth: int = 0) -> Path:
+    """Rewrite `path` so any wine reparse point along it points at its real target.
+
+    Cheap by construction: a path that already exists is returned untouched after a single
+    stat, so the xattr/component walk only ever runs for a path Python couldn't find."""
+    if _depth > 8 or path.exists():
+        return path
+    try:
+        rel = path.relative_to(prefix)
+    except ValueError:
+        return path
+    cur = prefix
+    parts = rel.parts
+    for i, part in enumerate(parts):
+        nxt = cur / part
+        if nxt.exists():
+            cur = nxt
+            continue
+        link = cur / (part + "?")
+        if not link.exists():
+            return path            # genuinely missing -- let the caller's exists() fail
+        target = _wine_reparse_target(link, prefix)
+        if target is None:
+            return path
+        rest = parts[i + 1:]
+        return _resolve_wine_path(prefix, target.joinpath(*rest) if rest else target,
+                                  _depth + 1)
+    return cur
+
+
 def _windows_path_to_unix(prefix: Path, value: str) -> Path:
     normalized = value.replace("\\\\", "\\")
     if re.match(r"^[A-Za-z]:\\", normalized):
@@ -1856,7 +2041,7 @@ def _windows_path_to_unix(prefix: Path, value: str) -> Path:
         base = prefix / f"drive_{drive}"
         if drive == "c":
             base = prefix / "drive_c"
-        return base / remainder
+        return _resolve_wine_path(prefix, base / remainder)
     return Path(normalized.replace("\\", "/"))
 
 def _library_roots(prefix: Path, steam_dir: Path) -> List[Path]:
@@ -2427,7 +2612,9 @@ def _win_path_to_host(prefix: Path, win_path: str) -> Optional[Path]:
     if win_path[0].lower() != "c":  # we only manage the C: drive
         return None
     rest = win_path[3:].replace("\\", "/")
-    return prefix / "drive_c" / rest
+    # a shortcut target can legitimately run through a wine reparse point (EA App's
+    # Start Menu entry does) -- resolve it, or the path looks missing to Python
+    return _resolve_wine_path(prefix, prefix / "drive_c" / rest)
 
 
 def cmd_scan_apps(params: Dict[str, Any]) -> Any:
@@ -2452,6 +2639,13 @@ def cmd_scan_apps(params: Dict[str, Any]) -> Any:
         (drive_c / "Program Files" / "Steam"),   # fresh fast-boot prefixes land Steam here
         (drive_c / "Program Files" / "Epic Games"),
     ]
+    # ...and every game the EA app has installed. Applications is for APPS; a game belongs on
+    # the Games tab (it shows up there via its store entry). Battlefield 4 was landing here as
+    # "EA Games" -- the Program Files fallback scan below found EA Games/Battlefield 4/bf4.exe
+    # and named the entry after the folder. Read the install dirs from EA's own registry record
+    # rather than hardcoding a folder name, so a custom install location is covered too. The
+    # EA app ITSELF stays listed: it lives under Electronic Arts\, not in a game's install dir.
+    excluded_roots += [ea["dir"] for ea in _ea_installed_games(prefix)]
 
     drive_c_resolved = drive_c.resolve()
 
@@ -2508,27 +2702,33 @@ def cmd_scan_apps(params: Dict[str, Any]) -> Any:
             if key not in found:
                 found[key] = {"name": lnk.stem, "exe": key, "args": info.get("args", "")}
 
-    # 2. Fallback: one app per Program Files subfolder when no shortcuts exist
-    if not found:
-        for pf in (drive_c / "Program Files", drive_c / "Program Files (x86)"):
-            if not pf.exists():
+    # 2. Fallback: one app per Program Files subfolder for apps with no shortcut of
+    # their own. Bradar this used to be gated on "if not found" (the WHOLE bottle
+    # has zero shortcuts) instead of per-app -- the moment ANY app in the bottle got
+    # a real Start Menu shortcut (e.g. a proper installer like VS Code's own), this
+    # entire fallback stopped running and silently dropped every app that was only
+    # ever discoverable through it (tools with no Start Menu entry of their own).
+    # The existing "key not in found" dedup below already prevents double-counting
+    # anything a shortcut already found, so this can just always run.
+    for pf in (drive_c / "Program Files", drive_c / "Program Files (x86)"):
+        if not pf.exists():
+            continue
+        try:
+            children = [c for c in pf.iterdir() if c.is_dir()]
+        except Exception:
+            children = []
+        for child in children:
+            if child.name.lower() in WINE_DEFAULT_DIRS:
                 continue
-            try:
-                children = [c for c in pf.iterdir() if c.is_dir()]
-            except Exception:
-                children = []
-            for child in children:
-                if child.name.lower() in WINE_DEFAULT_DIRS:
-                    continue
-                exe = _detect_exe(child, child.name, child.name)
-                if not exe:
-                    continue
-                exe_path = Path(exe)
-                if _excluded(exe_path):
-                    continue
-                key = str(exe_path)
-                if key not in found:
-                    found[key] = {"name": child.name, "exe": key, "args": ""}
+            exe = _detect_exe(child, child.name, child.name)
+            if not exe:
+                continue
+            exe_path = Path(exe)
+            if _excluded(exe_path):
+                continue
+            key = str(exe_path)
+            if key not in found:
+                found[key] = {"name": child.name, "exe": key, "args": ""}
 
     apps: List[Dict[str, Any]] = []
     for entry in found.values():
@@ -2849,17 +3049,80 @@ def _unified_pe_builtin(name: str, arch_dir: str) -> Optional[Path]:
 
 def _d3dmetal_native_dir() -> Path:
     """Where libd3dshared.dylib + D3DMetal.framework live for the d3dmetal backend
-    (bundled pack first, then the dev D3DMetalTesting tree)."""
+    (bundled pack first, then the dev D3DMetalTesting tree).
+
+    Require BOTH files, not just libd3dshared.dylib. libd3dshared dlopens D3DMetal via
+    @rpath=@loader_path, i.e. it looks for D3DMetal.framework RIGHT NEXT TO ITSELF -- so a
+    dir with the dylib but no framework is not a usable d3dmetal pack, it's a trap: routing
+    d3d there loads fine, logs "[D3DMETAL_FB] dlopen ok" + resolves d3d11/dxgi, and only
+    then dies on `Assertion failed: (GFXTHandle && "Failed to dlopen D3DMetal") ... shared.mm`
+    with no hint that a FILE is missing. Hit live 2026-07-25: wine-unified/mnc-d3d shipped
+    the dylib but not the framework (the wine-installer overlay had both), so every
+    d3dmetal launch under the unified engine asserted. Checking both here makes it fall
+    through to a pack that is actually complete instead."""
+    for d in (UNIFIED_D3D_DIR, D3DMETAL_NATIVE_DIR):
+        if (d / "libd3dshared.dylib").exists() and (d / "D3DMetal.framework").exists():
+            return d
+    # nothing complete -- warn loudly rather than silently returning a broken pack
     for d in (UNIFIED_D3D_DIR, D3DMETAL_NATIVE_DIR):
         if (d / "libd3dshared.dylib").exists():
+            log(f"d3dmetal: {d} has libd3dshared.dylib but NO D3DMetal.framework next to it "
+                f"-> d3dmetal launches will assert in shared.mm; copy the framework there")
             return d
     return D3DMETAL_NATIVE_DIR
+
+
+def _disable_shadowing_builtins() -> int:
+    """Move aside any wine builtin that shadows a backend-specific d3d DLL.
+
+    The loader rewrites a d3d module NAME (d3d10core.dll -> d3d10core_dxmt.dll) and then
+    resolves it -- but find_builtin_dll looks the builtin up by its ORIGINAL name, so if
+    wine still ships its own builtin for that module the builtin wins and the redirect is
+    silently defeated. The engine already had dxgi and d3d11 renamed aside by hand;
+    d3d10core was missed, so DXMT games got WINE's d3d10core, which imports
+    dxgi.DXGID3D10CreateDevice -- a symbol DXMT's dxgi (correctly) does not export. Wine
+    then stubs the import and terminates the process on the first D3D10 call:
+    "Call from ... to unimplemented function dxgi.dll.DXGID3D10CreateDevice, aborting".
+    Live-confirmed with a minimal D3D10CreateDevice probe: aborted before, returns S_OK
+    after, and the mapped image switches from wine's 159 KB builtin to DXMT's real 11 MB one.
+
+    The set is deliberately explicit rather than derived from the pack's filenames. It is
+    NOT "every module the pack ships a file for": the pack also ships canonical d3d10.dll,
+    d3d10_1.dll and d3d12.dll, and wine's d3d10 builtin in particular MUST stay -- it is the
+    public D3D10 API layer that calls D3D10CoreCreateDevice into the redirected d3d10core,
+    and there is no DXMT/DXVK d3d10 build to replace it with. Likewise wined3d and
+    winegstreamer only have per-backend variants (wined3d_opengl, winegstreamer_game) and
+    the loader falls back to wine's builtin for every other backend, so disabling those
+    breaks the fallback. Only these three are both redirected to a *_<backend>.dll target
+    AND have a canonical pack build to stand in for the builtin.
+
+    Idempotent, and x86_64 only -- the replacements are 64-bit builds, so a 32-bit process
+    must keep wine's builtins."""
+    d3d_dir = _unified_d3d_dir()
+    bt = _unified_build_dir()
+    if d3d_dir is None or bt is None:
+        return 0
+    moved = 0
+    for mod in ("dxgi", "d3d11", "d3d10core"):
+        if not (d3d_dir / f"{mod}.dll").exists():
+            continue    # no canonical replacement staged -> leave wine's builtin alone
+        builtin = bt / "dlls" / mod / "x86_64-windows" / f"{mod}.dll"
+        if not builtin.exists():
+            continue
+        try:
+            builtin.rename(builtin.with_suffix(".dll.builtin-disabled"))
+            log(f"unified: disabled wine builtin {mod}.dll so the backend redirect can win")
+            moved += 1
+        except Exception as exc:
+            log(f"unified: could not disable builtin {mod}.dll: {exc}")
+    return moved
 
 
 def _stage_unified_dlls(prefix: str) -> None:
     """Copy the unified d3d DLL slots into a prefix system32 so the loader has
     real targets to route to (canonical=DXMT plus *_d3dm and *_dxvk). Idempotent:
     only copies when the dest is missing or a different size."""
+    _disable_shadowing_builtins()
     src_dir = _unified_d3d_dir()
     if src_dir is None:
         log("unified: d3d DLL pack not found; backend routing may fail (run install_wine_unified)")
@@ -3021,6 +3284,114 @@ def _game_needs_dotnet(prefix: str, game_dir: str,
     return False
 
 
+# Bradar Titles marked HIGHDPIAWARE (see _apply_dpi_aware_regedit).
+# Keyed BOTH by exe and by title because the two launch paths know different things: a
+# manual/Steam launch hands us a real exe path, but an Epic THIRD-PARTY title (BF4 is
+# fulfilled through the EA App) has no legendary install record at all -- no install_path,
+# no executable -- so there the title from the disk library is the only handle we get.
+# A list, not a heuristic: the condition is "this game reads the display-mode list in
+# physical pixels but hit-tests in logical ones", which cannot be detected before launch.
+_DPI_AWARE_EXES = {"bf4.exe"}
+_DPI_AWARE_TITLE_HINTS = ("battlefield 4",)
+
+
+_hidpi_screen_cached: Optional[bool] = None
+
+
+def _screen_is_hidpi() -> bool:
+    """True when the main display has a backing scale > 1.
+
+    Same test the Swift side uses for the Retina Mode default
+    (`NSScreen.main.backingScaleFactor > 1.0`), done backend-side so it also covers launch
+    paths the UI doesn't originate. Deliberately NOT keyed off the retina_mode setting:
+    that is user-toggleable, and the DPI mismatch this gates is a property of the PANEL --
+    measured with Retina Mode OFF on a retina Mac, the monitor still reports 735x478 while
+    the display mode reports 1470x956, the same 2x disagreement."""
+    global _hidpi_screen_cached
+    if _hidpi_screen_cached is not None:
+        return _hidpi_screen_cached
+    _hidpi_screen_cached = _probe_screen_is_hidpi()
+    return _hidpi_screen_cached
+
+
+def _probe_screen_is_hidpi() -> bool:
+    try:
+        import ctypes, ctypes.util
+        lib = ctypes.util.find_library("CoreGraphics")
+        if not lib:
+            return False
+        cg = ctypes.CDLL(lib)
+        cg.CGMainDisplayID.restype = ctypes.c_uint32
+        cg.CGDisplayCopyDisplayMode.restype = ctypes.c_void_p
+        cg.CGDisplayCopyDisplayMode.argtypes = [ctypes.c_uint32]
+        cg.CGDisplayModeGetPixelWidth.restype = ctypes.c_size_t
+        cg.CGDisplayModeGetPixelWidth.argtypes = [ctypes.c_void_p]
+        cg.CGDisplayModeGetWidth.restype = ctypes.c_size_t
+        cg.CGDisplayModeGetWidth.argtypes = [ctypes.c_void_p]
+        cg.CGDisplayModeRelease.argtypes = [ctypes.c_void_p]
+
+        mode = cg.CGDisplayCopyDisplayMode(cg.CGMainDisplayID())
+        if not mode:
+            return False
+        try:
+            return cg.CGDisplayModeGetPixelWidth(mode) > cg.CGDisplayModeGetWidth(mode)
+        finally:
+            cg.CGDisplayModeRelease(mode)
+    except Exception:
+        return False
+
+
+def _game_needs_dpi_aware(prefix: str, game_dir: str, exe_name: str,
+                          app_name: str, bottle_cfg: Dict[str, Any],
+                          params: Dict[str, Any]) -> bool:
+    """Whether to force per-monitor DPI awareness for THIS game launch.
+
+    Explicit per-game opt-in (params/bottle_cfg 'dpi_aware') always wins; otherwise fall
+    back to the known-title list. Default OFF: forcing awareness stops wine virtualizing
+    screen coordinates, which is exactly what an older 96-DPI game WANTS, so it must not
+    become a blanket behaviour change."""
+    # A present-but-null value means "auto" (the UI sends that for its Auto setting), so it
+    # must fall through to the bottle setting rather than count as an explicit choice.
+    flag = params.get("dpi_aware")
+    if flag is None:
+        flag = bottle_cfg.get("dpi_aware")
+    if flag is not None:
+        return bool(flag)
+
+    # Only a HiDPI panel produces the mismatch this works around: on a 1x display wine
+    # scales nothing, the mode list and the monitor rect already agree, and there is
+    # nothing to correct. Checked after the explicit flag so a user can still force it.
+    if not _screen_is_hidpi():
+        return False
+
+    if exe_name and exe_name.lower() in _DPI_AWARE_EXES:
+        return True
+
+    if game_dir:
+        try:
+            for exe in _DPI_AWARE_EXES:
+                if (Path(game_dir) / exe).exists():
+                    return True
+        except Exception:
+            pass
+
+    # Epic third-party titles: no exe and no dir, so match the catalogue title.
+    if app_name:
+        try:
+            for g in _read_disk_library(prefix):
+                if g.get("app_name") != app_name:
+                    continue
+                title = (g.get("app_title")
+                         or g.get("metadata", {}).get("title", "") or "").lower()
+                if any(hint in title for hint in _DPI_AWARE_TITLE_HINTS):
+                    return True
+                break
+        except Exception:
+            pass
+
+    return False
+
+
 def _stage_unified_mf(prefix: str) -> None:
     """Stage the game-side winegstreamer video bridge into a prefix and re-point the
     wg_* MF CLSIDs at it so game intro videos decode. Idempotent: the DLL copy is
@@ -3151,10 +3522,15 @@ def _unified_game_backend(bottle_cfg: Dict[str, Any], backend: str = "") -> str:
 
 def _unified_env(prefix: str, game_backend: str, metal_hud: bool = False,
                  for_steam: bool = False, gst_debug: str = "",
-                 needs_dotnet: bool = False) -> Dict[str, str]:
+                 needs_dotnet: bool = False, cef_safe_mode: bool = False,
+                 debug: bool = False) -> Dict[str, str]:
     """Env for the unified wine. Steam exes always render via DXMT (loader gate);
     non-steam games follow MNC_GAME_BACKEND. GStreamer (MF/H.264 video) is wired for
-    GAMES ONLY -- Steam CEF crashes if it touches GStreamer so it gets none."""
+    GAMES ONLY -- Steam CEF crashes if it touches GStreamer so it gets none.
+    cef_safe_mode generalizes the Steam/EA CEF workaround (winegstreamer-block +
+    GPU-spoof flag injection) to any launch that opted in via force_dxmt_cef --
+    e.g. arbitrary "Applications" whose own CEF/Electron helper subprocesses
+    have no fixed name to hardcode, unlike Steam's/EA's."""
     env = dict(os.environ)
     for var in ("GTK_PATH", "GTK_EXE_PREFIX", "GTK_DATA_PREFIX", "GDK_PIXBUF_MODULEDIR",
                 "GDK_PIXBUF_MODULE_FILE", "GTK_IM_MODULE_FILE", "XDG_DATA_DIRS"):
@@ -3178,8 +3554,17 @@ def _unified_env(prefix: str, game_backend: str, metal_hud: bool = False,
     # Bradar d3dcompiler_47=n,b -> the real MS DLL we provision (native FIRST) with wines weak
     # builtin as fallbak (NEVER native alone, winetricks #2344). mscoree= disables .NET (kills
     # the CrashReport red-herring) EXCEPT for needs_dotnet games, where wine-mono must load.
+    # mshtml follows the SAME gate as mscoree: a plain game never touches embedded HTML/COM
+    # rendering, but anything needing a real CLR (WiX Burn installers w/ managed custom actions,
+    # EA App) commonly ALSO needs mshtml for its own UI (EULA text, Burn's bootstrapper chrome).
+    # Confirmed live: unconditionally blanking mshtml here broke EA App's installer entirely
+    # (mshtml.dll couldn't even load -> "class not registered" for its HTMLDocument CLSID),
+    # not just a missing-Gecko-path symptom. See _apply_gecko_regedit (called alongside
+    # _install_wine_mono at every needs_dotnet call site) for the matching Gecko provisioning --
+    # builtin mshtml still can't render anything without a Gecko package to point at.
     _mscoree = "" if needs_dotnet else "mscoree=;"
-    dll_ovr = f"winemenubuilder.exe=d;{_mscoree}mshtml=;d3dcompiler_47=n,b;nvapi,nvapi64="
+    _mshtml = "" if needs_dotnet else "mshtml=;"
+    dll_ovr = f"winemenubuilder.exe=d;{_mscoree}{_mshtml}d3dcompiler_47=n,b;nvapi,nvapi64="
     env.update({
         "WINEPREFIX": str(prefix),
         # msync OFF by default. The bundled unified wine is msync-capable (server
@@ -3190,7 +3575,12 @@ def _unified_env(prefix: str, game_backend: str, metal_hud: bool = False,
         # this value governs the Steam path outright. Flip back to "1" (n re-default
         # game_msync True) once the cold-boot msync fix lands. See steam-msync-port.
         "WINEMSYNC": "0",
-        "WINEDEBUG": "-all",
+        # Bradar the Debug toggle was a no-op for wine logging on the whole unified engine:
+        # this was hardcoded "-all", and the Epic path's verbose flag only fed gst_debug.
+        # So turning Debug on produced GStreamer chatter and not one extra wine line, on
+        # Steam, manual and Epic launches alike. WINE_DEBUG_VERBOSE was only ever wired
+        # into the classic path (_apply_backend_env).
+        "WINEDEBUG": WINE_DEBUG_VERBOSE if debug else "-all",
         "WINEDBG": "-all",
         "ROSETTA_ADVERTISE_AVX": "1",
         "CX_APPLEGPT_LIBD3DSHARED_PATH": libd3d,
@@ -3203,6 +3593,28 @@ def _unified_env(prefix: str, game_backend: str, metal_hud: bool = False,
         # the PE loader resolving 32-bit builtins from the wine lib dir post-bootstrap
         "MNC_SKIP_WOW64_INSTALL": "1",
         "MNC_GAME_BACKEND": game_backend,
+        # Bradar generalizes is_steam_client_process()'s hardcoded name-list gate (loader.c) and
+        # kernelbase's MNC_WEBHELPER_FLAGS/MNC_EA_WEBHELPER_EXTRA_FLAGS name checks (process.c) to
+        # any launch, not just Steam/EA -- inherited by the whole process tree so it reaches CEF
+        # helper subprocesses regardless of what they're named.
+        "MNC_CEF_SAFE_MODE": "1" if cef_safe_mode else "0",
+        # Bradar MNC_EA_WEBHELPER_EXTRA_FLAGS is deliberately NOT set (the engine still honours
+        # it as a manual escape hatch for a CEF app that needs extra switches -- it just has no
+        # default any more). It used to carry "--single-process" on the theory that EA App's
+        # multi-process CEF would make its GPU subprocess build a Metal swapchain for a HWND
+        # owned by another process, which DXMT rejects. 2026-07-25: measured, and BOTH halves of
+        # that were wrong. --in-process-gpu (in MNC_WEBHELPER_FLAGS below) already puts the GPU
+        # in the browser process -- the one that owns the HWND -- so with a normal multi-process
+        # CEF there are ZERO GPU-process crashes, zero cross-process swapchain rejections and
+        # zero "Failed to get metal layer" (the earlier blue-window run that prompted this had
+        # NO flags at all on its command line, so --in-process-gpu had never actually been tried
+        # on its own). And --single-process actively BROKE the app: it collapses the renderer
+        # into the browser process, so the renderer-side OnContextCreated that injects
+        # qt.webChannelTransport never runs -> EA's qwebchannelwrapper.js sees `qt` undefined,
+        # falls back to `new WebSocket("ws://127.0.0.1:4695")` which nothing ever listens on,
+        # times out after its own 30s CHANNEL_CONNECTION_TIMEOUT and leaves onLoginSuccess
+        # undefined -- sign-in completed but the UI never advanced past the login page. CEF
+        # documents single-process as debug-only; don't reach for it.
         # Bradar GPU-spoof so Steam CEF accepts ANGLE d3d11 -> DXMT (null-GPU crashes SwiftShader)
         # this is the exact load-bearing set from the proven steam-unified-run.sh
         "MNC_WEBHELPER_FLAGS": ("--no-sandbox --in-process-gpu --use-gl=angle --use-angle=d3d11 "
@@ -3319,6 +3731,115 @@ def _steam_dir(prefix) -> Path:
     if (noarch / "steam.exe").exists():
         return noarch
     return x86
+
+
+def _unreg_str(value: str) -> str:
+    """Decode a wine system.reg string value: \\\\ -> \\, \\" -> ", \\xNNNN -> the char."""
+    out, i = [], 0
+    while i < len(value):
+        c = value[i]
+        if c == "\\" and i + 1 < len(value):
+            nxt = value[i + 1]
+            if nxt == "x" and i + 5 < len(value):
+                try:
+                    out.append(chr(int(value[i + 2:i + 6], 16))); i += 6; continue
+                except ValueError:
+                    pass
+            out.append(nxt); i += 2; continue
+        out.append(c); i += 1
+    return "".join(out)
+
+
+def _ea_installed_games(prefix) -> List[Dict[str, Any]]:
+    """Every EA-App-installed game in a prefix, from EA's OWN record.
+
+    The EA app writes HKLM\\Software\\EA Games\\<Title> (plus the Wow6432Node mirror) with
+    DisplayName + "Install Dir" for each title it installs -- live-confirmed on Battlefield 4.
+    That is authoritative, covers a custom install location, and needs no per-title knowledge,
+    so prefer it over globbing a hardcoded "EA Games" folder. Returns [{"name", "dir"}] for
+    the entries whose install dir actually exists on disk."""
+    try:
+        reg = (Path(prefix).expanduser() / "system.reg").read_text(errors="ignore")
+    except Exception:
+        return []
+    out: Dict[str, Dict[str, Any]] = {}
+    # [Software\\EA Games\\<Title>]  or  [Software\\Wow6432Node\\EA Games\\<Title>]
+    # note the trailing ".*": wine writes the section's mtime after the closing bracket
+    for m in re.finditer(r'(?m)^\[Software\\\\(?:Wow6432Node\\\\)?EA Games\\\\([^\]\\\\]+)\].*$', reg):
+        body = reg[m.end():]
+        end = body.find("\n[")
+        body = body[:end] if end != -1 else body
+        dm = re.search(r'(?m)^"DisplayName"="([^"]*)"', body)
+        # value is backslash-escaped: a run of non-quote chars, or an escape pair (\\ , \x2122)
+        im = re.search(r'(?m)^"Install Dir"="((?:[^"\\]|\\.)*)"', body)
+        if not im:
+            continue
+        win_dir = _unreg_str(im.group(1))
+        host = _win_path_to_host(Path(prefix).expanduser(), win_dir.rstrip("\\/") )
+        if not host or not host.is_dir():
+            continue
+        name = _unreg_str(dm.group(1)) if dm else _unreg_str(m.group(1))
+        out[str(host)] = {"name": name, "dir": host}   # dedup the Wow6432Node mirror
+    return list(out.values())
+
+
+def _title_tokens(title: str) -> List[str]:
+    """Split a game title into comparable tokens, dropping trademark marks, punctuation and
+    case: "Battlefield 4(tm) Premium Edition" -> ["battlefield", "4", "premium", "edition"]."""
+    return re.findall(r"[a-z0-9]+", (title or "").lower())
+
+
+def _titles_match(a: List[str], b: List[str]) -> bool:
+    """Whether two tokenized titles name the SAME game across two stores.
+
+    One store's title routinely carries an edition/bundle suffix the other's does not
+    ("Battlefield 4(tm) Premium Edition" on Epic vs "Battlefield 4(tm)" in EA's registry), so
+    accept a token-prefix match. But a purely NUMERIC tail means a different entry in a series,
+    not an edition -- without that guard "skate." would match an installed "Skate 3", since
+    "skate" is a prefix of it either way."""
+    short, long_ = (a, b) if len(a) <= len(b) else (b, a)
+    if not short or len("".join(short)) < 4:
+        return False
+    if long_[:len(short)] != short:
+        return False
+    extra = long_[len(short):]
+    return not (extra and all(t.isdigit() for t in extra))
+
+
+def _ea_install_for_title(title: str, prefix) -> Optional[Dict[str, Any]]:
+    """Match a store title to an EA-App install of the same game, or None."""
+    want = _title_tokens(title)
+    best, best_len = None, -1
+    for ea in _ea_installed_games(prefix):
+        have = _title_tokens(ea["name"])
+        if _titles_match(want, have) and len(have) > best_len:
+            best, best_len = ea, len(have)   # most specific match wins
+    return best
+
+
+def _ea_app_dir(prefix) -> Path:
+    """The EA App (EA Desktop) install dir in a prefix -- the innermost folder actually
+    containing EADesktop.exe. Same both-arch-paths caveat as _steam_dir: EA App installs
+    as 64-bit, but check Program Files (x86) too in case a fast-booted prefix's WoW64
+    redirection lands it somewhere unexpected.
+
+    EA App installs (and self-updates) into a VERSIONED subfolder --
+    "EA Desktop/<version>/EA Desktop/EADesktop.exe" -- not directly under "EA Desktop/"
+    (confirmed live: checking the un-versioned path never matched, so cmd_install_ea_app
+    re-ran the installer on every single click even though EA App was already there).
+    An in-progress self-update stages into a second "<version>-<unix timestamp>" folder
+    before promoting it -- skip those (no reliable "-" in a real EA version string) and
+    prefer the highest real version if more than one is present."""
+    dc = Path(prefix).expanduser() / "drive_c"
+    for base_name in ("Program Files", "Program Files (x86)"):
+        base = dc / base_name / "Electronic Arts" / "EA Desktop"
+        candidates = sorted(
+            (v for v in base.glob("*/EA Desktop/EADesktop.exe") if "-" not in v.parent.parent.name),
+            key=lambda p: p.parent.parent.name,
+        )
+        if candidates:
+            return candidates[-1].parent
+    return dc / "Program Files" / "Electronic Arts" / "EA Desktop"
 
 
 _STEAM_SEED_EXCLUDES = ["steamapps/", "userdata/", "config/", "logs/", "dumps/",
@@ -3859,6 +4380,49 @@ def _prehack22_wine() -> str:
     return ""
 
 
+def _run_installer_unified(prefix: str, cmd_after_wine: List[str],
+                           backend: str = "dxmt",
+                           log_path: Optional[str] = None,
+                           env: Optional[Dict[str, str]] = None) -> subprocess.Popen:
+    """Launch an installer on the UNIFIED wine -- the pre-HACK22 overlay's replacement.
+
+    The whole reason _run_installer_prehack22 exists is that 32-bit NSIS/Burn stubs used to
+    fault-storm under the unified engine. That was root-caused 2026-07-25: the far `ljmp` in
+    dlls/wow64cpu/cpu.c's syscall_32to64 does not switch the CPU to 64-bit mode under
+    Rosetta 2, so the 64-bit body decoded as 32-bit and faulted (CW HACK 20760, now ported).
+    With that fixed, a 32-bit Burn bundle runs clean on the unified wine -- EA App's own
+    installer reaches "Apply complete, result: 0x0" -- so new callers should come here and
+    the overlay can be retired rather than grown.
+
+    Same mechanics as the overlay path: stage a real 32-bit subsystem first (a fast-booted
+    bottle with an empty syswow64 kills 32-bit installers with c0000135), run under
+    arch -x86_64 with an in-shell DYLD re-export (arch strips DYLD_*), and tee wine's output
+    to log_path so an install is never a silent black box."""
+    bt = _unified_build_dir()
+    if not bt:
+        # the unified engine is optional (Setup tab) -- a bottle on the classic engine still
+        # has to be able to install things, so keep the old chain rather than hard-failing
+        log("installer: unified wine not installed -> pre-HACK22/Wine-Stable installer path")
+        return _run_installer_prehack22(prefix, cmd_after_wine, backend,
+                                        log_path=log_path, env=env)
+    if env is None:
+        env = _unified_env(prefix, backend or "dxmt", False, for_steam=False)
+        env["WINEDEBUG"] = "-all,+err"
+    _stage_syswow64(prefix)
+    _ensure_progfiles_x86(prefix)
+    _stage_unified_dlls(prefix)
+    out = open(log_path, "w") if log_path else subprocess.DEVNULL
+    wine = str(bt / "wine")
+    dyld = env.get("DYLD_FALLBACK_LIBRARY_PATH", "")
+    tail = " ".join(shlex.quote(a) for a in cmd_after_wine)
+    sh = (f"export DYLD_FALLBACK_LIBRARY_PATH={shlex.quote(dyld)}\n"
+          f"exec {shlex.quote(wine)} {tail}")
+    log(f"installer (unified wine): {cmd_after_wine}")
+    return subprocess.Popen(["/usr/bin/arch", "-x86_64", "/bin/bash", "-lc", sh],
+                            env=env, stdout=out, stderr=subprocess.STDOUT,
+                            start_new_session=True)
+
+
 def _run_installer_prehack22(prefix: str, cmd_after_wine: List[str],
                              backend: str = "d3dmetal",
                              log_path: Optional[str] = None,
@@ -4111,71 +4675,6 @@ def _run_shared_commonredist(prefix: str, backend: str) -> None:
         log(f"shared redist: processd {handled} uncoverd CommonRedist redist(s) via pre-HACK22 wine")
 
 
-def _ea_disable_updater(exe_path: Path) -> None:
-    """Turn off the EA apps self-updater (EACore.ini [Bootstrap] EnableUpdating=false) so it cant
-    relaunch EADesktop.exe + strip the Chromium flags we pass on argv. Best-effort (EA may regen it,
-    but the argv flags on OUR initial launch reach the CEF browser regardless)."""
-    ini = exe_path.parent / "EACore.ini"
-    try:
-        if not ini.exists():
-            return
-        txt = ini.read_text(errors="ignore")
-        if re.search(r"(?im)^\s*EnableUpdating\s*=\s*false", txt):
-            return
-        if re.search(r"(?im)^\s*EnableUpdating\s*=", txt):
-            txt = re.sub(r"(?im)^\s*EnableUpdating\s*=.*$", "EnableUpdating=false", txt)
-        elif re.search(r"(?im)^\s*\[Bootstrap\]\s*$", txt):
-            txt = re.sub(r"(?im)^(\s*\[Bootstrap\]\s*)$", r"\1\nEnableUpdating=false", txt, count=1)
-        else:
-            txt = txt.rstrip() + "\n[Bootstrap]\nEnableUpdating=false\n"
-        ini.write_text(txt)
-        log("EA: disabled self-updater (EACore.ini EnableUpdating=false)")
-    except Exception as exc:
-        log(f"EA: could not edit EACore.ini: {exc}")
-
-
-def _launch_ea_app(prefix: str, exe_path: Path, args: str, params: Dict[str, Any]) -> Any:
-    """Launch the EA app (EADesktop.exe -- a CEF/Chromium launcher, like Steams webhelper) on the
-    PRE-HACK22 (stock-%gs) wine with the CEF blank-content fix. GATED: fires only for
-    launcher_type=='ea' / EADesktop.exe, so the unified engine + HACK22 (load-bearing for Steam/RE4)
-    stay untouched. The blue-blank content is a Chromium GPU-compositing failure (same class as the
-    Steam CEF null-GPU wall); on this stock-%gs wine we cant route ANGLE->d3d11 (HACK30 is
-    steam.exe-only + no DXVK staged), so we use Chromiums SOFTWARE compositor (--disable-gpu = Skia
-    CPU, which also dodges the SwiftShader crash). Flags go on EADesktop.exe's ARGV -- it IS the CEF
-    browser proc, so Chromium forwards the GPU switches to its GPU/renderer children (this is the
-    load-bearing delivery; no kernelbase matcher needed since we disable EAs self-relaunch). Needs
-    mono + native d3dcompiler_47 + corefonts (Hafliss/Gcenx confirmed). Escape hatch for the hardware
-    path: set MNC_EA_CEF_FLAGS. See the EA-app workflow + [[ea-app-blank-content]] memory."""
-    _provision_redist_dlls(prefix)                      # real MS d3dcompiler_47 (Gcenx: needed)
-    try:
-        _install_wine_mono(prefix, "d3dmetal")          # .NET via wine-mono (mscoree ENABLED below)
-    except Exception as exc:
-        log(f"EA: wine-mono install skipped: {exc}")
-    try:
-        _install_corefonts(prefix)                      # MS core fonts for the CEF UI text
-    except Exception as exc:
-        log(f"EA: corefonts install skipped: {exc}")
-    _ea_disable_updater(exe_path)                        # so EA cant relaunch + strip our argv flags
-    # env: pre-HACK22 wine (via _run_installer_prehack22), mscoree ENABLED (needs_dotnet=True),
-    # GStreamer STRIPPED (for_steam=True), d3dcompiler_47=n,b already in the override.
-    env = _unified_env(prefix, "d3dmetal", metal_hud=False, for_steam=True, needs_dotnet=True)
-    env["WINEDEBUG"] = "-all,+err"
-    flags = os.environ.get(
-        "MNC_EA_CEF_FLAGS",
-        "--no-sandbox --disable-gpu --disable-gpu-compositing --in-process-gpu",
-    )
-    env["QTWEBENGINE_CHROMIUM_FLAGS"] = flags            # belt-and-suspenders if the EA UI is Qt WebEngine
-    for v in ("GST_PLUGIN_PATH", "GST_PLUGIN_SYSTEM_PATH", "GST_PLUGIN_SYSTEM_PATH_1_0",
-              "GST_REGISTRY", "GST_REGISTRY_1_0"):
-        env.pop(v, None)                                 # keep GStreamer far from the CEF (crashs it)
-    logf = str(LOG_DIR / "EADesktop-wine.log")
-    tail = [str(exe_path)] + (shlex.split(args) if args else []) + flags.split()   # argv = load-bearing
-    proc = _run_installer_prehack22(prefix, tail, "d3dmetal", log_path=logf, env=env)
-    _running_games[proc.pid] = proc
-    log(f"launch: EA app (EADesktop) via pre-HACK22 wine + CEF software-GPU flags; log {logf}")
-    return {"pid": proc.pid, "log_path": logf, "engine": "prehack22-ea"}
-
-
 def _launch_game_unified(prefix: str, exe: str, args: str, bottle_cfg: Dict[str, Any],
                          params: Dict[str, Any]) -> Any:
     """Launch a game through the unified wine; the loader routes its d3d to the
@@ -4195,17 +4694,31 @@ def _launch_game_unified(prefix: str, exe: str, args: str, bottle_cfg: Dict[str,
         _running_games[proc.pid] = proc
         log(f"launch: SteamSetup.exe routed to pre-HACK22 installer wine (silent); log {logf}")
         return {"pid": proc.pid}
-    # Bradar the EA app (EADesktop.exe) is a CEF/Chromium launcher that HACK22 breaks (mscoree forced
-    # off + %gs fault-storm + GStreamer crashs its CEF) n whose embedded browser blue-blanks on the
-    # unified wine -> route it to a gated pre-HACK22 path w/ the CEF software-GPU fix. Additive; the
-    # unified engine + HACK22 (Steam/RE4) r untouched. Triggerd by launcher_type=='ea' OR the exe name.
-    if bottle_cfg.get("launcher_type") == "ea" or exe_path.name.lower() == "eadesktop.exe":
-        return _launch_ea_app(str(prefix), exe_path, args, params)
+    # DEPRECATED 2026-07-25: the EA app (EADesktop.exe) used to be routed to a gated pre-HACK22
+    # overlay path (_launch_ea_app, since removed) becuse HACK22 appeard to break its CEF/mscoree
+    # startup. The
+    # real cause was never HACK22: it was the missing Rosetta-2 WoW64 thunk workaround in
+    # dlls/wow64cpu/cpu.c (far ljmp not switching the CPU to 64-bit under Rosetta, so
+    # syscall_32to64's body decoded as 32-bit n faulted). That is fixed in the engine now
+    # (MNC ROSETTA-THUNK / CW HACK 20760), so EA App no longer needs a special launch path --
+    # it goes through the SAME generic "Application" route as any other CEF/Chromium app
+    # (force_dxmt_cef -> DXMT + the CEF flag injection), on the unified wine. Keeping one code
+    # path here is the whole point: no per-app exe-name gating, no overlay wine to maintain.
     _stage_unified_dlls(str(prefix))
     _stage_unified_mf(str(prefix))
     _provision_redist_dlls(str(prefix))   # real MS d3dcompiler_47 file-drop (no installer, safe)
     _ensure_steam_sdl_resolvable(str(prefix))
-    backend = _unified_game_backend(bottle_cfg, params.get("backend", ""))
+    # Bradar arbitrary "Applications" (cmd_launch_app -> launchGame's force_dxmt_cef) are far
+    # more likely than a chosen game to embed a CEF/Chromium UI (Electron, Qt WebEngine, other
+    # launchers users point MacNdCheese at). Plain D3DMetal crashes those the same way it crashed
+    # EA App's Link2EA.exe this session ("Failed to dlopen D3DMetal" assertion in shared.mm) even
+    # when the process never really renders 3D -- just loading d3d11.dll/dxgi.dll as a dependency
+    # is enough. DXMT doesn't have that failure mode, so force it for this whole launch class
+    # regardless of the bottle's configured default_backend, same as EA App's own origin-launch.
+    if params.get("force_dxmt_cef"):
+        backend = "dxmt"
+    else:
+        backend = _unified_game_backend(bottle_cfg, params.get("backend", ""))
     metal_hud = params.get("metal_hud", bottle_cfg.get("metal_hud", False))
     debug = bool(params.get("debug", bottle_cfg.get("debug", False)))
     steam_mode = params.get("steam_mode", "silent")
@@ -4254,7 +4767,8 @@ def _launch_game_unified(prefix: str, exe: str, args: str, bottle_cfg: Dict[str,
             except Exception as exc:
                 log(f"unified: steam auto-launch failed: {exc} (continuing)")
     env = _unified_env(prefix, backend, metal_hud, gst_debug=("5" if debug else "3"),
-                       needs_dotnet=needs_dotnet)
+                       needs_dotnet=needs_dotnet, cef_safe_mode=bool(params.get("force_dxmt_cef")),
+                       debug=debug)
     # Bradar VR: register the wineopenxr bridge as the prefixs active OpenXR runtime + force
     # our bundled x86_64 Monado runtime (an arm64 system one wont dlopen into the Rosetta wine)
     if backend == "vr":
@@ -4285,8 +4799,31 @@ def _launch_game_unified(prefix: str, exe: str, args: str, bottle_cfg: Dict[str,
     # the latter is the install-style loader and cannot find the build nls -> l_intl.nls fails
     wine = str(bt / "wine")
     _apply_retina_unified(bt, wine, env, params.get("retina_mode", bottle_cfg.get("retina_mode", False)))
+    if _game_needs_dpi_aware(str(prefix), str(exe_path.parent), exe_path.name, "",
+                             bottle_cfg, params):
+        _apply_dpi_aware_regedit(wine, env, {exe_path.name})
+    if needs_dotnet:
+        _apply_gecko_regedit(wine, env)   # mshtml is enabled above (needs_dotnet); give it a Gecko to render with
     safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", exe_path.stem)
     log_path = str(LOG_DIR / f"{safe_name}-wine.log")
+    # CEF-safe-mode Applications: deliver the GPU-spoof + single-process switches on the
+    # launched exe's OWN argv. The engine (kernelbase/process.c) only injects these when it
+    # intercepts CreateProcess -- i.e. for CHILD processes -- but the exe we start here IS the
+    # CEF *browser* process, launched directly by us, so that hook never fires for it and it
+    # comes up with no window at all (confirmed live with EA App: CEF children spawned n died,
+    # EADesktop sat at 0% CPU logging "Ui initialization completed" with nothing on screen).
+    # The old EA-only path hardcoded these onto EADesktop.exe's argv; doing it here instead
+    # means ANY Application/launcher gets it with no exe-name gating. Chromium forwards the
+    # switches to its own children, so one delivery covers the whole tree. Never clobber a
+    # user-supplied switch.
+    if params.get("force_dxmt_cef"):
+        _cef_argv = (env.get("MNC_WEBHELPER_FLAGS", "") + " "
+                     + env.get("MNC_EA_WEBHELPER_EXTRA_FLAGS", "")).split()
+        _have = {p.split("=", 1)[0] for p in (shlex.split(args) if args else []) if p.startswith("--")}
+        _add = [f for f in _cef_argv if f.split("=", 1)[0] not in _have]
+        if _add:
+            args = ((args + " ") if args else "") + " ".join(_add)
+            log(f"CEF-safe-mode Application: appended {len(_add)} CEF/GPU switch(es) to argv")
     quoted_args = (" " + args) if args else ""
     cmd = (
         # export DYLD inside the shell. the outer arch (SIP-restricted) strips DYLD_* so
@@ -4942,6 +5479,147 @@ def cmd_get_setup_pid(_params: Dict[str, Any]) -> Any:
     global _setup_proc
     running = _setup_proc is not None and _setup_proc.poll() is None
     return {"running": running}
+
+
+_ea_app_setup_proc: Optional[subprocess.Popen] = None
+
+
+def _download_and_run_eaapp_setup(prefix: str, wine: str, setup_path: Optional[str] = None) -> None:
+    """Run EAappInstaller.exe in the given prefix (background thread). Same
+    download/silent-install pattern as _download_and_run_steam_setup --
+    runs on the unified wine (_run_installer_unified).
+
+    CONFIRMED live (2026-07-21): the Lutris prerequisite note below was right.
+    A fresh bottle with none of the prerequisites provisioned below (real MS
+    d3dcompiler_47, wine-mono, corefonts, mscoree enabled) fails EA App's own
+    installer with "err:msi:ITERATE_Actions Execution halted, action
+    L"JunoInitializeSession" returned 1603" plus repeated
+    "err:mscoree:LoadLibraryShim error reading registry key for installroot" --
+    an install-time custom action needs a working CLR, which the plain
+    for_steam=False env explicitly disables (mscoree=;). Matches a public
+    Linux Mint forum report hitting the identical JunoInitializeSession/1603
+    failure. A bottle that happened to already have these from unrelated
+    earlier winetricks/game activity (real d3dcompiler_47 via `winetricks
+    d3dcompiler_47`, in particular) installs fine, which is why this went
+    unnoticed until tested against a genuinely fresh bottle.
+
+    NOTE: the SAME 1603 failure still reproduces on the pre-HACK22 overlay even
+    WITH all these prerequisites in place, while the identical installer/prefix
+    setup installs clean under plain Wine Stable -- so there's a genuine,
+    not-yet-root-caused difference in our own wine build (pre-HACK22 ntdll +
+    whatever else differs from stock) breaking this one MSI custom action.
+    Actively being investigated at the engine level rather than worked around."""
+    global _ea_app_setup_proc
+    try:
+        if setup_path and Path(setup_path).expanduser().exists():
+            exe = Path(setup_path).expanduser()
+            log(f"Using provided EAappInstaller.exe: {exe}")
+        else:
+            exe = Path(tempfile.gettempdir()) / "EAappInstaller.exe"
+            if not exe.exists() or exe.stat().st_size < 1_000_000:
+                log("Downloading EAappInstaller.exe...")
+                dl_ok = False
+                try:
+                    rc = subprocess.run(["/usr/bin/curl", "-fsSL", "-o", str(exe), EA_APP_SETUP_URL],
+                                        capture_output=True, timeout=300).returncode
+                    dl_ok = (rc == 0 and exe.exists() and exe.stat().st_size > 1_000_000)
+                except Exception as cexc:
+                    log(f"curl download failed: {cexc}")
+                if not dl_ok:
+                    import ssl as _ssl
+                    noverify = _ssl.create_default_context()
+                    noverify.check_hostname = False
+                    noverify.verify_mode = _ssl.CERT_NONE
+                    with urllib.request.urlopen(EA_APP_SETUP_URL, context=noverify, timeout=300) as resp:
+                        exe.write_bytes(resp.read())
+                log("EAappInstaller.exe downloaded.")
+        # EA App's installer needs all of these for its own JunoInitializeSession custom
+        # action (confirmed live, see docstring above), not just the launched app.
+        _provision_redist_dlls(prefix)                      # real MS d3dcompiler_47
+        try:
+            _install_wine_mono(prefix, "d3dmetal")           # working CLR for the installer's custom actions
+        except Exception as exc:
+            log(f"EA App install: wine-mono install skipped: {exc}")
+        try:
+            _install_corefonts(prefix)                       # MS core fonts for the installer's own CEF UI
+        except Exception as exc:
+            log(f"EA App install: corefonts install skipped: {exc}")
+
+        logf = str(Path(prefix) / "mnc-eaapp-installer.log")
+        log(f"Launching EAappInstaller.exe in {prefix} (pre-HACK22 wine so the installer stub wont fault-storm; log {logf})")
+        # Confirmed live: neither /S nor /silent produced an actual silent install -- the
+        # installer (itself CEF-based, per EA's own docs) launched real GUI/GPU-init
+        # processes (MoltenVK/Vulkan init in the log, 2 Dock icons, no window content, no
+        # files ever landing) and then exited with nothing installed. This matches a
+        # well-documented CEF-under-Wine failure mode (blank/non-rendering window unless
+        # GPU compositing is disabled) rather than a silent-flag problem. Append the
+        # standard CEF/Chromium flags known to fix this class of bug.
+        #
+        # DEPRECATED 2026-07-25: this used to run on the pre-HACK22 overlay wine with
+        # Chromium's SOFTWARE compositor (--disable-gpu --disable-gpu-compositing). Both are
+        # gone. The 1603/JunoInitializeSession failure the docstring above describes was never
+        # a missing prerequisite or an overlay-vs-unified difference -- it was the missing
+        # Rosetta-2 WoW64 thunk workaround in dlls/wow64cpu/cpu.c (a far ljmp not switching the
+        # CPU to 64-bit, so syscall_32to64's body decoded as 32-bit and faulted). With that
+        # fixed in the engine, EA's own Burn installer runs to "Apply complete, result: 0x0"
+        # on the unified wine (live-confirmed 2026-07-25), so it takes the same generic CEF
+        # path as everything else: DXMT + cef_safe_mode, and real GPU rendering rather than
+        # the software fallback. The prerequisites above stay -- they are genuinely needed.
+        install_env = _unified_env(prefix, "dxmt", False, for_steam=False,
+                                   needs_dotnet=True, cef_safe_mode=True)
+        install_env["WINEDEBUG"] = "-all,+err"
+        # unified engine is optional; fall back to whatever wine _run_installer_unified will
+        # itself fall back to, so the gecko regedit never becomes the thing that fails here
+        _ubt = _unified_build_dir()
+        gecko_wine = str(_ubt / "wine") if _ubt else _prehack22_wine()
+        if gecko_wine:
+            _apply_gecko_regedit(gecko_wine, install_env)   # mshtml is enabled above (needs_dotnet)
+        # the installer stub IS a CEF browser process, and we start it directly, so hand it
+        # the switches on argv (the engine's CreateProcess hook only sees its children)
+        cef_argv = install_env.get("MNC_WEBHELPER_FLAGS", "").split()
+        proc = _run_installer_unified(
+            prefix, [str(exe), "/silent"] + cef_argv, log_path=logf, env=install_env,
+        )
+        _ea_app_setup_proc = proc
+    except Exception as exc:
+        log(f"Warning: failed to run EAappInstaller: {exc}")
+
+
+def cmd_install_ea_app(params: Dict[str, Any]) -> Any:
+    """Kick off the EA App bootstrap for a bottle, lazily -- called the first
+    time the user interacts with an EA-managed Epic title, not at bottle
+    creation time like Steam (most Epic bottles never touch one)."""
+    prefix = params.get("prefix")
+    if not prefix:
+        raise ValueError("Missing 'prefix' parameter")
+    if (_ea_app_dir(prefix) / "EADesktop.exe").exists():
+        return {"already_installed": True}
+    wine = _find_wine()
+    if not wine:
+        raise RuntimeError("Wine not found")
+    threading.Thread(
+        target=_download_and_run_eaapp_setup,
+        args=(prefix, wine, params.get("ea_app_setup_path")),
+        daemon=True,
+    ).start()
+    return {"already_installed": False}
+
+
+def cmd_ea_app_install_status(params: Dict[str, Any]) -> Any:
+    """Drives the "Installing EA App…" loading screen, mirroring cmd_steam_install_status.
+    installed = EADesktop.exe present. running = an EAappInstaller process is still alive."""
+    prefix = params.get("prefix")
+    if not prefix:
+        raise ValueError("Missing 'prefix' parameter")
+    installed = (_ea_app_dir(prefix) / "EADesktop.exe").exists()
+    running = False
+    try:
+        out = subprocess.run(["pgrep", "-f", "EAappInstaller"], capture_output=True,
+                             text=True, timeout=5).stdout.strip()
+        running = bool(out)
+    except Exception:
+        pass
+    return {"installed": installed, "running": running}
 
 
 def cmd_steam_install_status(params: Dict[str, Any]) -> Any:
@@ -7639,6 +8317,95 @@ def _read_installed_here(prefix: str) -> Dict[str, Dict[str, Any]]:
     return results
 
 
+def _epic_third_party_store(g: Dict[str, Any]) -> Optional[str]:
+    """Returns e.g. "The EA App" for Epic-catalog titles Epic's own catalog
+    flags as requiring install/activation through another launcher (surfaced
+    by `legendary info --json` as `external_activation`), else None. Read
+    straight from the same raw metadata blob `legendary list --json` already
+    returns and that's already cached on disk -- no extra network/subprocess
+    call needed."""
+    try:
+        ca = g.get("metadata", g).get("customAttributes", {})
+        return ca.get("ThirdPartyManagedApp", {}).get("value") or None
+    except (AttributeError, TypeError):
+        return None
+
+
+def _epic_third_party_store_for(app_name: str, prefix: str) -> Optional[str]:
+    """Looks up _epic_third_party_store() for a single app_name from the
+    already-cached disk library -- no network call. Used at launch time to
+    decide whether this title needs the link2ea:// handoff instead of a
+    normal legendary launch."""
+    for g in _read_disk_library(prefix):
+        if g.get("app_name") == app_name:
+            return _epic_third_party_store(g)
+    return None
+
+
+def _epic_origin_launch_uri(app_name: str, prefix: str) -> Optional[str]:
+    """Builds the same link2ea://launchgame/... URI legendary's own `launch --origin`
+    would build, and returns it for us to hand to `wine start` directly.
+
+    Bundled legendary is 0.20.34 (Dec 2023) -- 8 months before upstream commit
+    56a2314 ("Support both origin and EA App names", #632, Aug 2024) taught
+    `Game.is_origin_game` to recognize "The EA App", not just the older "Origin"
+    string. Epic's catalog now universally uses "The EA App" for these entries, so
+    `legendary launch --origin` unconditionally fails with "not an Origin title"
+    on this build (live-confirmed) -- it never even reaches the URI construction.
+    No newer official release exists to upgrade to (0.20.34 is still "Latest").
+
+    Rather than patch/replace the shared legendary binary (used for every Epic
+    install, not just this), replicate just the URI-building step using pieces
+    legendary already exposes/maintains on disk: `get-token` (stable, documented
+    CLI command) for the exchange code, and its own persisted user.json for the
+    account identity. Mirrors legendary/core.py's get_origin_uri() exactly."""
+    try:
+        lenv = _legendary_env(prefix)
+        # Bradar 120s, not 30s. This is a live round-trip to Epic's auth service: ~13-14s on
+        # an idle machine, but 32-40s measured on a heavily loaded one -- and a game launch
+        # is exactly when the machine is busy. At 30s that tips over and the launch dies with
+        # "Could not build the EA App launch link", making a third-party title unlaunchable
+        # for a reason that has nothing to do with the title. The ceiling only costs us
+        # patience in the failure case, so keep it well clear of the load-induced range.
+        r = subprocess.run(
+            _legendary_cmd(prefix) + ["get-token", "--json"],
+            capture_output=True, text=True, timeout=120, env=lenv,
+        )
+        token = json.loads(r.stdout) if r.stdout.strip() else {}
+        code = token.get("code")
+        if not code:
+            log(f"EA origin launch: get-token failed for {app_name}: {r.stderr.strip()[:300]}")
+            return None
+
+        user_path = _legendary_config_dir(prefix) / "user.json"
+        user = json.loads(user_path.read_text())
+        username = user.get("displayName", "")
+        account_id = user.get("account_id", "")
+        if not account_id:
+            log(f"EA origin launch: no account_id in user.json for {prefix}")
+            return None
+
+        params = [
+            ("AUTH_PASSWORD", code),
+            ("AUTH_TYPE", "exchangecode"),
+            ("epicusername", username),
+            ("epicuserid", account_id),
+            ("epiclocale", "en"),
+        ]
+        for g in _read_disk_library(prefix):
+            if g.get("app_name") == app_name:
+                extra = (g.get("metadata", g).get("customAttributes", {})
+                         .get("AdditionalCommandline", {}).get("value"))
+                if extra:
+                    params.extend(urllib.parse.parse_qsl(extra))
+                break
+
+        return f"link2ea://launchgame/{app_name}?{urllib.parse.urlencode(params)}"
+    except Exception as exc:
+        log(f"EA origin launch: failed to build link2ea:// URI for {app_name}: {exc}")
+        return None
+
+
 def _build_games_list(prefix: str, owned_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Build the game list from owned library + current installed state (all disk reads, no network)."""
     installed_here = _read_installed_here(prefix)
@@ -7650,6 +8417,17 @@ def _build_games_list(prefix: str, owned_list: List[Dict[str, Any]]) -> List[Dic
             continue
         is_installed = app_name in installed_here
         install_dir = installed_here[app_name].get("install_path", "") if is_installed else ""
+        third_party = _epic_third_party_store(g)
+        # A third-party-managed title (EA app etc.) is installed by that launcher, not by
+        # legendary, so legendary's installed record NEVER lists it -- the card stayed on
+        # "Download" forever even with the game sitting on disk. Ask the managing launcher's
+        # own record instead. Only consulted when legendary has nothing, so a normal Epic
+        # install is completely unaffected.
+        if not is_installed and third_party:
+            ea = _ea_install_for_title(app_title, prefix)
+            if ea:
+                is_installed = True
+                install_dir = str(ea["dir"])
         exe = _detect_exe(Path(install_dir), app_name, app_title) if install_dir else None
         cover_url = _legendary_cover_url(g.get("metadata", g))
         games.append({
@@ -7664,6 +8442,7 @@ def _build_games_list(prefix: str, owned_list: List[Dict[str, Any]]) -> List[Dic
             "is_installed": is_installed,
             "update_available": False,
             "epic_app_name": app_name,
+            "third_party_store": third_party,
         })
     games.sort(key=lambda g: (0 if g["is_installed"] else 1, g["name"].lower()))
     return games
@@ -8432,6 +9211,7 @@ def cmd_legendary_all_downloads(_params: Dict[str, Any]) -> Any:
                 "queue_position": 0,
                 "paused": False,
                 "prefix": prefix,
+                "error": None,
             }
         for i, (app_name, prefix) in enumerate(_legendary_download_queue):
             result[app_name] = {
@@ -8440,6 +9220,7 @@ def cmd_legendary_all_downloads(_params: Dict[str, Any]) -> Any:
                 "queue_position": i + 1,
                 "paused": False,
                 "prefix": prefix,
+                "error": None,
             }
     for app_name, prefix in _legendary_paused.items():
         log_path = str(LEGENDARY_DIR / f"install_{app_name}.log")
@@ -8449,7 +9230,18 @@ def cmd_legendary_all_downloads(_params: Dict[str, Any]) -> Any:
             "queue_position": 0,
             "paused": True,
             "prefix": prefix,
+            "error": None,
         }
+    for app_name, info in _legendary_failed.items():
+        if app_name not in result:
+            result[app_name] = {
+                "progress": 0.0,
+                "queued": False,
+                "queue_position": 0,
+                "paused": False,
+                "prefix": info["prefix"],
+                "error": info["error"],
+            }
     return result
 
 
@@ -8473,6 +9265,7 @@ def cmd_legendary_launch_game(params: Dict[str, Any]) -> Any:
     prefix_expanded = str(Path(prefix).expanduser().resolve())
     bottle_cfg = _load_bottles().get(_resolve_key(prefix), {})
     unified = _unified_engine_active(bottle_cfg)
+    third_party_store = _epic_third_party_store_for(app_name, prefix)
 
     # Epic never hands MacNCheese a raw exe path (legendary owns exe invocation), so
     # look it up from legendary's own installed-games record. Used below to DLL-patch
@@ -8493,11 +9286,47 @@ def cmd_legendary_launch_game(params: Dict[str, Any]) -> Any:
         bt = _unified_build_dir()
         _stage_unified_dlls(prefix_expanded)
         _stage_unified_mf(prefix_expanded)
+        # DEPRECATED 2026-07-28: this used to force dxmt for the whole third-party launch, so
+        # EA App's CEF processes wouldn't crash on D3DMetal. It also bound the GAME -- picking
+        # D3DMetal on Battlefield 4's card silently ran BF4 on DXMT, whose dxgi is the only one
+        # of our five builds missing the private DXGID3D10CreateDevice export wine's own d3d10
+        # calls, so BF4 aborted before its menu. The engine now scopes the DXMT redirect to CEF
+        # host processes itself (is_cef_host_process(), libcef.dll beside the exe), so the
+        # launcher gets DXMT and the game gets whatever the user actually chose.
         game_backend = _unified_game_backend(bottle_cfg, backend)
+        # Bradar a third-party-managed title (BF4 etc.) launches by handing a link2ea:// URI to
+        # the EA App, so this launch IS a CEF launch even though the exe we invoke is `wine
+        # start`. It needs the same CEF treatment the Applications section gets or EA App comes
+        # up as an empty blue window: MNC_CEF_SAFE_MODE is what lets the engine recognise
+        # EADesktop.exe as a CEF browser process (libcef.dll beside it) and put the GPU-spoof
+        # switches on the command line Link2EA/EALaunchHelper builds for it -- we never invoke
+        # EADesktop ourselves here, so argv delivery cannot reach it. Also blocks winegstreamer
+        # for the tree, same as any other CEF app.
         env = _unified_env(prefix_expanded, game_backend, metal_hud,
-                            gst_debug=("5" if verbose_debug else "3"))
+                            gst_debug=("5" if verbose_debug else "3"),
+                            cef_safe_mode=bool(third_party_store),
+                            debug=verbose_debug)
+        # Bradar backend-specific env, same as _launch_game_unified does for Steam/manual
+        # launches. This path never had it, so an Epic game set to DXVK came up with
+        # "Required Vulkan extension VK_KHR_surface not supported" (no MoltenVK ICD wired) and
+        # a VR title got no OpenXR runtime at all -- both selectable from the game card, both
+        # broken only here. Kept in sync deliberately; see _launch_game_unified.
+        if game_backend == "vr":
+            _ensure_wineopenxr_registered(prefix_expanded)
+            env = _apply_monado_runtime_env(env)
+        if game_backend == "dxvk":
+            vk_icd = _find_moltenvk_icd()
+            if vk_icd:
+                env["VK_ICD_FILENAMES"] = vk_icd   # legacy vulkan-loader name
+                env["VK_DRIVER_FILES"] = vk_icd    # modern vulkan-loader name
+            env.setdefault("DXVK_STATE_CACHE", "0")
         # bt/wine, not bt/loader/wine -- the loader-style path can't find the build nls
         wine_bin = str(bt / "wine")
+        if _game_needs_dpi_aware(prefix_expanded, install_dir, exe_name, app_name,
+                                 bottle_cfg, params):
+            # A third-party title hands us no exe, so fall back to the known-title list --
+            # the registry key is matched on basename, which is all wine needs.
+            _apply_dpi_aware_regedit(wine_bin, env, {exe_name} if exe_name else _DPI_AWARE_EXES)
     else:
         # Classic fallback (unified wine not installed, or bottle engine="classic").
         # Resolve "auto"/"" the same way cmd_launch_game does (issue #105) instead of
@@ -8555,14 +9384,27 @@ def cmd_legendary_launch_game(params: Dict[str, Any]) -> Any:
     # Inject per-bottle legendary config path into the Wine environment
     env["LEGENDARY_CONFIG_PATH"] = str(_legendary_config_dir(prefix))
 
-    # legendary launch handles Epic auth token generation and passes all required
-    # -AUTH_TYPE / -AUTH_PASSWORD / -epicapp / etc. args to Wine automatically.
-    cmd = _legendary_cmd(prefix) + [
-        "launch", app_name,
-        "--wine", wine_bin,
-        "--wine-prefix", prefix_expanded,
-        "--skip-version-check",
-    ]
+    # Titles Epic's catalog flags as third-party-managed (e.g. Battlefield 4, fulfilled
+    # via "The EA App") have no real manifest to launch directly -- hand off to the
+    # managing launcher instead. Derived here (not passed from Swift) so it applies to
+    # any such title launched through this one function, not just ones the UI knows about.
+    # Build the link2ea:// handoff ourselves (see _epic_origin_launch_uri) rather than
+    # `legendary launch --origin` -- the bundled legendary predates EA App-name support
+    # and unconditionally rejects these titles as "not an Origin title" (live-confirmed).
+    if third_party_store:
+        uri = _epic_origin_launch_uri(app_name, prefix)
+        if not uri:
+            raise RuntimeError(f"Could not build the EA App launch link for {app_name}")
+        cmd = [wine_bin, "start", uri]
+    else:
+        # legendary launch handles Epic auth token generation and passes all required
+        # -AUTH_TYPE / -AUTH_PASSWORD / -epicapp / etc. args to Wine automatically.
+        cmd = _legendary_cmd(prefix) + [
+            "launch", app_name,
+            "--wine", wine_bin,
+            "--wine-prefix", prefix_expanded,
+            "--skip-version-check",
+        ]
     log(f"legendary launch: {shlex.join(cmd)}")
     safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", app_name)
     log_path = str(LOG_DIR / f"{safe_name}-legendary.log")
@@ -8637,6 +9479,10 @@ def cmd_nile_launch_game(params: Dict[str, Any]) -> Any:
                             gst_debug=("5" if verbose_debug else "3"))
         # bt/wine, not bt/loader/wine -- the loader-style path can't find the build nls
         wine_bin = str(bt / "wine")
+        _amazon_exe = exe_path.name if exe_path else ""
+        if _amazon_exe and _game_needs_dpi_aware(prefix_expanded, install_dir,
+                                                 _amazon_exe, "", bottle_cfg, params):
+            _apply_dpi_aware_regedit(wine_bin, env, {_amazon_exe})
     else:
         # Classic fallback (unified wine not installed, or bottle engine="classic").
         # Resolve "auto"/"" the same way cmd_launch_game does (issue #105) instead of
@@ -9157,6 +10003,8 @@ COMMANDS: Dict[str, Any] = {
     "get_steam_running": cmd_get_steam_running,
     "get_setup_pid": cmd_get_setup_pid,
     "steam_install_status": cmd_steam_install_status,
+    "install_ea_app": cmd_install_ea_app,
+    "ea_app_install_status": cmd_ea_app_install_status,
     "reorder_bottles": cmd_reorder_bottles,
     "launch_launcher": cmd_launch_launcher,
     "get_exe_icon": cmd_get_exe_icon,
