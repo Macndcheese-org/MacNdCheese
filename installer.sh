@@ -2319,6 +2319,7 @@ install_wine_unified() {
     find "$dst" -name 'wine' -type f -exec chmod +x {} \; 2>/dev/null || true
     xattr -dr com.apple.quarantine "$dst" 2>/dev/null || true
     stage_unified_d3d_pack "$dst"
+    disable_builtin_d3d_slots "$dst"
     stage_redist_pack
     sign_unified_wine "$dst"
     echo "install_wine_unified: done ($(du -sh "$dst" 2>/dev/null | cut -f1))"
@@ -2343,6 +2344,7 @@ install_wine_unified() {
     fi
   done
   stage_unified_d3d_pack "$dst"
+  disable_builtin_d3d_slots "$dst"
   stage_redist_pack
   sign_unified_wine "$dst"
   echo "install_wine_unified: done ($(du -sh "$dst" 2>/dev/null | cut -f1))"
@@ -2479,6 +2481,32 @@ stage_mnc_sdl() {
     fi
   done
   echo "stage_mnc_sdl: no bundled mnc-sdl found (controllers may not work)"
+}
+
+disable_builtin_d3d_slots() {
+  # Wine resolves a builtin by the PE's INTERNAL name, not by the file name. So when the loader
+  # routes d3d11/dxgi/d3d10core/d3d12 to a _dxmt/_dxvk/_d3dm variant, find_builtin_dll still looks
+  # up the ORIGINAL name -- and if wine's own build slot still holds that dll, the BUILTIN wins and
+  # the variant sitting in system32 is silently ignored. Nothing errors; you just get wine's
+  # implementation while believing you're on DXMT.
+  #
+  # That is exactly how the Rockstar launcher broke. Wine's builtin d3d10core loaded insted of
+  # DXMT's, and the builtin imports dxgi!DXGID3D10CreateDevice -- a symbol DXMT's dxgi has no
+  # reason to export, because DXMT's own d3d10core forwards straight to d3d11 and never needs the
+  # glue. Every d3d10 title then died on "unimplemented function dxgi.dll.DXGID3D10CreateDevice".
+  #
+  # d3d11/dxgi/d3d12 were disabled by hand in the wine tree long ago; d3d10core was missed, and a
+  # rebuild re-creates any of them. Doing it here makes it self-healing insted of a step somebody
+  # has to remember. 64-bit only: DXMT/DXVK are x86_64, so the i386 builtins stay as they are.
+  local dst n f
+  dst="$1"
+  for n in d3d11 dxgi d3d10core d3d12; do
+    f="$dst/dlls/$n/x86_64-windows/$n.dll"
+    if [ -e "$f" ]; then
+      mv -f "$f" "$f.builtin-disabled" 2>/dev/null && echo "disable_builtin_d3d_slots: disabled builtin $n (variant DLLs now win)"
+    fi
+  done
+  return 0
 }
 
 stage_unified_d3d_pack() {
