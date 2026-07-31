@@ -4715,9 +4715,12 @@ def _launch_game_unified(prefix: str, exe: str, args: str, bottle_cfg: Dict[str,
     # when the process never really renders 3D -- just loading d3d11.dll/dxgi.dll as a dependency
     # is enough. DXMT doesn't have that failure mode, so force it for this whole launch class
     # regardless of the bottle's configured default_backend, same as EA App's own origin-launch.
-    force_cef = bool(params.get("force_dxmt_cef")) or _is_cef_launcher(params.get("exe", ""))
-    if force_cef:
-        backend = "dxmt"
+    _cef_backend = _cef_launcher_backend(params.get("exe", ""))
+    force_cef = bool(params.get("force_dxmt_cef")) or _cef_backend is not None
+    if _cef_backend is not None:
+        backend = _cef_backend       # per-launcher, see _CEF_LAUNCHER_BACKENDS
+    elif params.get("force_dxmt_cef"):
+        backend = "dxmt"             # generic Applications, per the EA App finding
     else:
         backend = _unified_game_backend(bottle_cfg, params.get("backend", ""))
     metal_hud = params.get("metal_hud", bottle_cfg.get("metal_hud", False))
@@ -4844,39 +4847,51 @@ def _launch_game_unified(prefix: str, exe: str, args: str, bottle_cfg: Dict[str,
     return {"pid": proc.pid, "log_path": log_path, "backend": backend, "engine": "unified"}
 
 
-# Launchers whos UI is CEF/Chromium: they must go down the same road Steam does (DXMT +
-# the GPU-spoof flag injection), no matter HOW the user started them. Plain D3DMetal kills
-# these the moment d3d11/dxgi is loaded as a dependency, even before anything renders
-# ("Failed to dlopen D3DMetal"), and without the CEF flags the GPU proc crash-loops into a
-# black window. force_dxmt_cef only ever got set by the Applications section, so the exact
-# same launcher started from the game grid quietly took the broken path -- hence match on
-# the exe too. Rockstar's Launcher.exe + SocialClubHelper.exe are the wine kernelbase hook's
-# other named target besides steamwebhelper, so the engine side is allready expecting them.
-_CEF_LAUNCHER_EXES = (
-    "launcher.exe",            # Rockstar Games Launcher
-    "socialclubhelper.exe",    # its CEF helper
-    "launcherpatcher.exe",
-    "eadesktop.exe",           # EA App
-    "link2ea.exe",
-    "epicgameslauncher.exe",
-)
+# Launchers with a CEF/Chromium UI all need Steam's *flag* treatment -- the GPU-spoof
+# switches the kernelbase hook injects -- or their GPU process crash-loops into a black
+# window. That part is universal. The BACKEND is not, and picking one for everybody breaks
+# somebody:
+#
+#   EA App   -> DXMT. Plain D3DMetal aborts the instant d3d11/dxgi loads as a dependency,
+#               even with nothing rendering ("Failed to dlopen D3DMetal" in Link2EA.exe).
+#   Rockstar -> DXVK. RGL is D3D10, and dxgi_dxmt is the one variant with NO
+#               DXGID3D10CreateDevice export (d3dm has 5, dxvk 7, opengl 2, dxmt 0), so on
+#               DXMT it dies "unimplemented function dxgi.dll.DXGID3D10CreateDevice".
+#               Auto-resolve hands unknown launchers DXMT, which is exactly how RGL went
+#               from booting to aborting. Measured: DXVK takes that abort count to 0 and
+#               RGL reaches its own init. (The "failed to initialize" past this point is
+#               the separate wine-SCM frontier, not a graphics problem.)
+_CEF_LAUNCHER_BACKENDS = {
+    "socialclubhelper.exe":        "dxvk",      # Rockstar CEF helper
+    "launcher.exe":                "dxvk",      # Rockstar Games Launcher (dir-checked below)
+    "launcherpatcher.exe":         "dxvk",
+    "rockstar-games-launcher.exe": "dxvk",      # the installer
+    "playrdr2.exe":                "dxvk",
+    "eadesktop.exe":               "dxmt",      # EA App
+    "link2ea.exe":                 "dxmt",
+}
+
+
+def _cef_launcher_backend(exe: str) -> Optional[str]:
+    """Backend a known CEF launcher must use, or None when this isn't one.
+
+    Split on BOTH separators by hand: these are windows paths but we run on macOS, where
+    Path() treats a backslash as an ordinary character -- Path(r"C:\\x\\Launcher.exe").name
+    hands back the whole string and every match silently fails."""
+    raw = str(exe or "").replace("\\", "/")
+    name = raw.rsplit("/", 1)[-1].lower()
+    backend = _CEF_LAUNCHER_BACKENDS.get(name)
+    if backend is None:
+        return None
+    # "Launcher.exe" is far too generic to claim outright -- only Rockstar's, which always
+    # lives under a Rockstar Games dir. An indie game shipping the same name is untouched.
+    if name in ("launcher.exe", "launcherpatcher.exe") and "rockstar" not in raw.lower():
+        return None
+    return backend
 
 
 def _is_cef_launcher(exe: str) -> bool:
-    """True for launchers that must take the Steam-style CEF path.
-
-    Split on BOTH separators by hand: these are windows paths but we are running on macOS,
-    where Path() treats a backslash as an ordinary character, so Path(r"C:\\...\\Launcher.exe")
-    .name hands back the whole string and every match silently fails."""
-    raw = str(exe or "").replace("\\", "/")
-    name = raw.rsplit("/", 1)[-1].lower()
-    if name not in _CEF_LAUNCHER_EXES:
-        return False
-    # "Launcher.exe" is a common enough name that we only claim it for Rockstar's,
-    # which always sits under a Rockstar Games dir.
-    if name in ("launcher.exe", "launcherpatcher.exe"):
-        return "rockstar" in str(exe).lower()
-    return True
+    return _cef_launcher_backend(exe) is not None
 
 
 def cmd_launch_game(params: Dict[str, Any]) -> Any:
