@@ -784,6 +784,39 @@ def _wine_env(prefix: str) -> Dict[str, str]:
     return env
 
 
+def _apply_dpi_aware_regedit(wine: str, env: dict, exes: set) -> None:
+    r"""Mark executables DPI-aware using wine's OWN app-compat mechanism.
+
+    HKCU\...\AppCompatFlags\Layers keyed by the lowercased exe BASENAME is the same
+    knob Windows exposes for forcing a legacy app HiDPI-aware, and win32u applies it at
+    startup (sysparams.c, "HIGHDPIAWARE") -- crucially BEFORE any window exists, so the
+    windows are created aware and every geometry API agrees from the outset.
+
+    This is why nothing has to be patched into wine: with Retina Mode on, wine reports the
+    display-mode list in physical pixels but monitor rects and mouse input in logical ones,
+    and a fullscreen game caught between the two mis-places the cursor and can end up with
+    a black window. Marking it aware makes both answers physical.
+
+    An embedded manifest that simply omits dpiAware (Battlefield 4 ships exactly that)
+    cannot be overridden with an external manifest, since wine prefers the embedded one --
+    the registry layer is the supported way in."""
+    if not exes:
+        return
+    lines = ["REGEDIT4", "",
+             "[HKEY_CURRENT_USER\\Software\\Microsoft\\Windows NT\\CurrentVersion"
+             "\\AppCompatFlags\\Layers]"]
+    for exe in sorted(exes):
+        lines.append(f'"{exe.lower()}"="HIGHDPIAWARE"')
+    try:
+        reg_file = Path(tempfile.gettempdir()) / "wine_dpi_aware.reg"
+        reg_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        subprocess.run([wine, "regedit", str(reg_file)], env=env, timeout=300,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        log(f"Applied regedit: HIGHDPIAWARE for {sorted(exes)}")
+    except Exception as exc:
+        log(f"dpi-aware regedit failed: {exc}")
+
+
 def _apply_retina_regedit(wine: str, env: dict, retina_mode: bool) -> None:
     """Apply RetinaMode, Resolution and LogPixels via `wine regedit file.reg`."""
     retina_val = "y" if retina_mode else "n"
@@ -1130,7 +1163,9 @@ def _resolve_auto_backend(exe_path: Optional[str] = None) -> str:
 # exception diagnostics through — exactly what the default "-all" suppresses
 # (DLL load failures, unresolved imports, crashes). This is what would have made
 # the SDL3.dll + UE4 crash diagnoses instant.
-WINE_DEBUG_VERBOSE = "+loaddll,+module,+seh"
+# Set MNC_WINEDEBUG to override this for a session (e.g. "+seh,+coreaudio,+mmdevapi" when
+# chasing an audio abort) without editing code.
+WINE_DEBUG_VERBOSE = os.environ.get("MNC_WINEDEBUG", "+loaddll,+module,+seh")
 
 
 def _apply_backend_env(env: Dict[str, str], backend: str, debug: bool = False) -> Dict[str, str]:
@@ -3197,6 +3232,114 @@ def _game_needs_dotnet(prefix: str, game_dir: str,
     return False
 
 
+# Bradar Titles marked HIGHDPIAWARE (see _apply_dpi_aware_regedit).
+# Keyed BOTH by exe and by title because the two launch paths know different things: a
+# manual/Steam launch hands us a real exe path, but an Epic THIRD-PARTY title (BF4 is
+# fulfilled through the EA App) has no legendary install record at all -- no install_path,
+# no executable -- so there the title from the disk library is the only handle we get.
+# A list, not a heuristic: the condition is "this game reads the display-mode list in
+# physical pixels but hit-tests in logical ones", which cannot be detected before launch.
+_DPI_AWARE_EXES = {"bf4.exe"}
+_DPI_AWARE_TITLE_HINTS = ("battlefield 4",)
+
+
+_hidpi_screen_cached: Optional[bool] = None
+
+
+def _screen_is_hidpi() -> bool:
+    """True when the main display has a backing scale > 1.
+
+    Same test the Swift side uses for the Retina Mode default
+    (`NSScreen.main.backingScaleFactor > 1.0`), done backend-side so it also covers launch
+    paths the UI doesn't originate. Deliberately NOT keyed off the retina_mode setting:
+    that is user-toggleable, and the DPI mismatch this gates is a property of the PANEL --
+    measured with Retina Mode OFF on a retina Mac, the monitor still reports 735x478 while
+    the display mode reports 1470x956, the same 2x disagreement."""
+    global _hidpi_screen_cached
+    if _hidpi_screen_cached is not None:
+        return _hidpi_screen_cached
+    _hidpi_screen_cached = _probe_screen_is_hidpi()
+    return _hidpi_screen_cached
+
+
+def _probe_screen_is_hidpi() -> bool:
+    try:
+        import ctypes, ctypes.util
+        lib = ctypes.util.find_library("CoreGraphics")
+        if not lib:
+            return False
+        cg = ctypes.CDLL(lib)
+        cg.CGMainDisplayID.restype = ctypes.c_uint32
+        cg.CGDisplayCopyDisplayMode.restype = ctypes.c_void_p
+        cg.CGDisplayCopyDisplayMode.argtypes = [ctypes.c_uint32]
+        cg.CGDisplayModeGetPixelWidth.restype = ctypes.c_size_t
+        cg.CGDisplayModeGetPixelWidth.argtypes = [ctypes.c_void_p]
+        cg.CGDisplayModeGetWidth.restype = ctypes.c_size_t
+        cg.CGDisplayModeGetWidth.argtypes = [ctypes.c_void_p]
+        cg.CGDisplayModeRelease.argtypes = [ctypes.c_void_p]
+
+        mode = cg.CGDisplayCopyDisplayMode(cg.CGMainDisplayID())
+        if not mode:
+            return False
+        try:
+            return cg.CGDisplayModeGetPixelWidth(mode) > cg.CGDisplayModeGetWidth(mode)
+        finally:
+            cg.CGDisplayModeRelease(mode)
+    except Exception:
+        return False
+
+
+def _game_needs_dpi_aware(prefix: str, game_dir: str, exe_name: str,
+                          app_name: str, bottle_cfg: Dict[str, Any],
+                          params: Dict[str, Any]) -> bool:
+    """Whether to force per-monitor DPI awareness for THIS game launch.
+
+    Explicit per-game opt-in (params/bottle_cfg 'dpi_aware') always wins; otherwise fall
+    back to the known-title list. Default OFF: forcing awareness stops wine virtualizing
+    screen coordinates, which is exactly what an older 96-DPI game WANTS, so it must not
+    become a blanket behaviour change."""
+    # A present-but-null value means "auto" (the UI sends that for its Auto setting), so it
+    # must fall through to the bottle setting rather than count as an explicit choice.
+    flag = params.get("dpi_aware")
+    if flag is None:
+        flag = bottle_cfg.get("dpi_aware")
+    if flag is not None:
+        return bool(flag)
+
+    # Only a HiDPI panel produces the mismatch this works around: on a 1x display wine
+    # scales nothing, the mode list and the monitor rect already agree, and there is
+    # nothing to correct. Checked after the explicit flag so a user can still force it.
+    if not _screen_is_hidpi():
+        return False
+
+    if exe_name and exe_name.lower() in _DPI_AWARE_EXES:
+        return True
+
+    if game_dir:
+        try:
+            for exe in _DPI_AWARE_EXES:
+                if (Path(game_dir) / exe).exists():
+                    return True
+        except Exception:
+            pass
+
+    # Epic third-party titles: no exe and no dir, so match the catalogue title.
+    if app_name:
+        try:
+            for g in _read_disk_library(prefix):
+                if g.get("app_name") != app_name:
+                    continue
+                title = (g.get("app_title")
+                         or g.get("metadata", {}).get("title", "") or "").lower()
+                if any(hint in title for hint in _DPI_AWARE_TITLE_HINTS):
+                    return True
+                break
+        except Exception:
+            pass
+
+    return False
+
+
 def _stage_unified_mf(prefix: str) -> None:
     """Stage the game-side winegstreamer video bridge into a prefix and re-point the
     wg_* MF CLSIDs at it so game intro videos decode. Idempotent: the DLL copy is
@@ -3327,7 +3470,8 @@ def _unified_game_backend(bottle_cfg: Dict[str, Any], backend: str = "") -> str:
 
 def _unified_env(prefix: str, game_backend: str, metal_hud: bool = False,
                  for_steam: bool = False, gst_debug: str = "",
-                 needs_dotnet: bool = False, cef_safe_mode: bool = False) -> Dict[str, str]:
+                 needs_dotnet: bool = False, cef_safe_mode: bool = False,
+                 debug: bool = False) -> Dict[str, str]:
     """Env for the unified wine. Steam exes always render via DXMT (loader gate);
     non-steam games follow MNC_GAME_BACKEND. GStreamer (MF/H.264 video) is wired for
     GAMES ONLY -- Steam CEF crashes if it touches GStreamer so it gets none.
@@ -3379,7 +3523,12 @@ def _unified_env(prefix: str, game_backend: str, metal_hud: bool = False,
         # this value governs the Steam path outright. Flip back to "1" (n re-default
         # game_msync True) once the cold-boot msync fix lands. See steam-msync-port.
         "WINEMSYNC": "0",
-        "WINEDEBUG": "-all",
+        # Bradar the Debug toggle was a no-op for wine logging on the whole unified engine:
+        # this was hardcoded "-all", and the Epic path's verbose flag only fed gst_debug.
+        # So turning Debug on produced GStreamer chatter and not one extra wine line, on
+        # Steam, manual and Epic launches alike. WINE_DEBUG_VERBOSE was only ever wired
+        # into the classic path (_apply_backend_env).
+        "WINEDEBUG": WINE_DEBUG_VERBOSE if debug else "-all",
         "WINEDBG": "-all",
         "ROSETTA_ADVERTISE_AVX": "1",
         "CX_APPLEGPT_LIBD3DSHARED_PATH": libd3d,
@@ -4566,7 +4715,11 @@ def _launch_game_unified(prefix: str, exe: str, args: str, bottle_cfg: Dict[str,
             except Exception as exc:
                 log(f"unified: steam auto-launch failed: {exc} (continuing)")
     env = _unified_env(prefix, backend, metal_hud, gst_debug=("5" if debug else "3"),
-                       needs_dotnet=needs_dotnet, cef_safe_mode=bool(params.get("force_dxmt_cef")))
+                       needs_dotnet=needs_dotnet, cef_safe_mode=bool(params.get("force_dxmt_cef")),
+                       debug=debug)
+    if _game_needs_dpi_aware(str(prefix), str(exe_path.parent), exe_path.name, "",
+                             bottle_cfg, params):
+        _apply_dpi_aware_regedit(wine, env, {exe_path.name})
     # Bradar VR: register the wineopenxr bridge as the prefixs active OpenXR runtime + force
     # our bundled x86_64 Monado runtime (an arm64 system one wont dlopen into the Rosetta wine)
     if backend == "vr":
@@ -8141,9 +8294,15 @@ def _epic_origin_launch_uri(app_name: str, prefix: str) -> Optional[str]:
     account identity. Mirrors legendary/core.py's get_origin_uri() exactly."""
     try:
         lenv = _legendary_env(prefix)
+        # Bradar 120s, not 30s. This is a live round-trip to Epic's auth service: ~13-14s on
+        # an idle machine, but 32-40s measured on a heavily loaded one -- and a game launch
+        # is exactly when the machine is busy. At 30s that tips over and the launch dies with
+        # "Could not build the EA App launch link", making a third-party title unlaunchable
+        # for a reason that has nothing to do with the title. The ceiling only costs us
+        # patience in the failure case, so keep it well clear of the load-induced range.
         r = subprocess.run(
             _legendary_cmd(prefix) + ["get-token", "--json"],
-            capture_output=True, text=True, timeout=30, env=lenv,
+            capture_output=True, text=True, timeout=120, env=lenv,
         )
         token = json.loads(r.stdout) if r.stdout.strip() else {}
         code = token.get("code")
@@ -9075,7 +9234,8 @@ def cmd_legendary_launch_game(params: Dict[str, Any]) -> Any:
         # for the tree, same as any other CEF app.
         env = _unified_env(prefix_expanded, game_backend, metal_hud,
                             gst_debug=("5" if verbose_debug else "3"),
-                            cef_safe_mode=bool(third_party_store))
+                            cef_safe_mode=bool(third_party_store),
+                            debug=verbose_debug)
         # Bradar backend-specific env, same as _launch_game_unified does for Steam/manual
         # launches. This path never had it, so an Epic game set to DXVK came up with
         # "Required Vulkan extension VK_KHR_surface not supported" (no MoltenVK ICD wired) and
@@ -9092,6 +9252,11 @@ def cmd_legendary_launch_game(params: Dict[str, Any]) -> Any:
             env.setdefault("DXVK_STATE_CACHE", "0")
         # bt/wine, not bt/loader/wine -- the loader-style path can't find the build nls
         wine_bin = str(bt / "wine")
+        if _game_needs_dpi_aware(prefix_expanded, install_dir, exe_name, app_name,
+                                 bottle_cfg, params):
+            # A third-party title hands us no exe, so fall back to the known-title list --
+            # the registry key is matched on basename, which is all wine needs.
+            _apply_dpi_aware_regedit(wine_bin, env, {exe_name} if exe_name else _DPI_AWARE_EXES)
     else:
         # Classic fallback (unified wine not installed, or bottle engine="classic").
         # Resolve "auto"/"" the same way cmd_launch_game does (issue #105) instead of
@@ -9244,6 +9409,11 @@ def cmd_nile_launch_game(params: Dict[str, Any]) -> Any:
                             gst_debug=("5" if verbose_debug else "3"))
         # bt/wine, not bt/loader/wine -- the loader-style path can't find the build nls
         wine_bin = str(bt / "wine")
+        if _game_needs_dpi_aware(prefix_expanded, install_dir, exe_name, app_name,
+                                 bottle_cfg, params):
+            # A third-party title hands us no exe, so fall back to the known-title list --
+            # the registry key is matched on basename, which is all wine needs.
+            _apply_dpi_aware_regedit(wine_bin, env, {exe_name} if exe_name else _DPI_AWARE_EXES)
     else:
         # Classic fallback (unified wine not installed, or bottle engine="classic").
         # Resolve "auto"/"" the same way cmd_launch_game does (issue #105) instead of

@@ -24,6 +24,18 @@
     <string>12.0</string>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <!-- macOS gates microphone access through TCC, which attributes a bare child process
+         (the unified Wine's loader/wine is a plain Mach-O, NOT an .app bundle) to the
+         responsible app that launched it -- us. Without this key that whole chain is
+         denied, and a denied CoreAudio capture call traps rather than returning an error:
+         wine's handle_syscall_fault turns it into STATUS_ILLEGAL_INSTRUCTION, and
+         mmdevapi's wine_unix_call() does assert(!status) -> raise(22), so the GAME
+         aborts itself the moment it opens a voice-chat capture stream (live-confirmed
+         with Battlefield 4). installer.sh's add_mic_usage_to_app() already injects this
+         into the Wine Stable/D3DMetal .app bundles, but the unified engine has no bundle
+         to patch, so declaring it here is what covers every engine. -->
+    <key>NSMicrophoneUsageDescription</key>
+    <string>MacNdCheese runs Windows games that use the microphone for in-game voice chat.</string>
     <key>NSPrincipalClass</key>
     <string>NSApplication</string>
     <key>UTImportedTypeDeclarations</key>

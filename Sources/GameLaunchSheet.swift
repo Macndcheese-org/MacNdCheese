@@ -17,6 +17,7 @@ struct GameLaunchSheet: View {
     @State private var loadingBackends = true
     @State private var retinaMode: Bool = NSScreen.main.map { $0.backingScaleFactor > 1.0 } ?? false
     @State private var metalHud: Bool = false
+    @State private var dpiAware: Bool = false
     // Bradar this hold the microfone info bradar
     @State private var micInfu: AudioInpitInfo?
     @State private var gameMode: Bool = true
@@ -57,6 +58,7 @@ struct GameLaunchSheet: View {
                         graphicsSection
                         argsSection
                         retinaSection
+                        dpiAwareSection
                         metalHudToggle
                         gameModeToggle
                         advancedDebugToggle
@@ -254,6 +256,29 @@ struct GameLaunchSheet: View {
         .opacity(hasRetinaScreen ? 1.0 : 0.5)
     }
 
+    /// Same rule the backend applies (_game_needs_dpi_aware): the mismatch only exists on
+    /// a HiDPI panel, and only these titles are known to trip over it. Kept in sync with
+    /// _DPI_AWARE_EXES / _DPI_AWARE_TITLE_HINTS in backend_server.py.
+    private var defaultDpiAware: Bool {
+        guard hasRetinaScreen else { return false }
+        let hay = (game.name + " " + selectedExe).lowercased()
+        return hay.contains("battlefield 4") || hay.contains("bf4.exe")
+    }
+
+    private var dpiAwareSection: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Toggle(isOn: $dpiAware) {
+                Text(L("HiDPI coordinate fix"))
+                    .font(.caption)
+                    .fontWeight(.semibold)
+            }
+            Text(L("On a Retina display Wine reports the screen size and the display-mode list in different units, so some fullscreen games mis-place the mouse or show a black window. Enabled automatically for games known to need it."))
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+        .opacity(hasRetinaScreen ? 1.0 : 0.5)
+    }
+
     private var metalHudToggle: some View {
         Toggle(isOn: $metalHud) {
             Text(L("Metal HUD"))
@@ -428,6 +453,7 @@ struct GameLaunchSheet: View {
         if let a = cfg["args"] as? String { extraArgs = a }
         if let r = cfg["retina_mode"] as? Bool { retinaMode = r }
         if let h = cfg["metal_hud"] as? Bool { metalHud = h }
+        dpiAware = cfg["dpi_aware"] as? Bool ?? defaultDpiAware
         if let gm = cfg["game_mode"] as? Bool { gameMode = gm }
         if let d = cfg["debug"] as? Bool { advancedDebug = d }
         if let e = cfg["esync"] as? Bool { enableEsync = e }
@@ -446,6 +472,7 @@ struct GameLaunchSheet: View {
             "args": extraArgs,
             "retina_mode": retinaMode,
             "metal_hud": metalHud,
+            "dpi_aware": dpiAware,
             "game_mode": gameMode,
             "debug": advancedDebug,
             "esync": sync.esync,
@@ -559,7 +586,8 @@ struct GameLaunchSheet: View {
                     esync: sync.esync,
                     msync: sync.msync,
                     customEnv: env,
-                    debug: advancedDebug
+                    debug: advancedDebug,
+                    dpiAware: dpiAware
                 )
             } else if let amazonId = game.amazonId {
                 await backend.amazonLaunchGame(
@@ -572,7 +600,8 @@ struct GameLaunchSheet: View {
                     esync: sync.esync,
                     msync: sync.msync,
                     customEnv: env,
-                    debug: advancedDebug
+                    debug: advancedDebug,
+                    dpiAware: dpiAware
                 )
             } else {
                 let exe = effectiveExe
@@ -592,7 +621,8 @@ struct GameLaunchSheet: View {
                     steamAppId: game.appid,
                     steamMode: steamMode,
                     customEnv: env,
-                    debug: advancedDebug
+                    debug: advancedDebug,
+                    dpiAware: dpiAware
                 )
             }
             isLaunching = false

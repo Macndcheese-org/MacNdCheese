@@ -23,6 +23,7 @@ struct GameDetailView: View {
     @State private var loadingBackends = true
     @State private var retinaMode: Bool = NSScreen.main.map { $0.backingScaleFactor > 1.0 } ?? false
     @State private var metalHud: Bool = false
+    @State private var dpiAware: Bool = false
     @State private var gameMode: Bool = true
     @State private var advancedDebug: Bool = false
     @State private var enableEsync: Bool = true
@@ -259,6 +260,7 @@ struct GameDetailView: View {
             graphicsSection
             argsSection
             retinaSection
+            dpiAwareSection
             metalHudToggle
             gameModeToggle
             advancedDebugToggle
@@ -354,6 +356,29 @@ struct GameDetailView: View {
         }
     }
 
+    /// Same rule the backend applies (_game_needs_dpi_aware): the mismatch only exists on
+    /// a HiDPI panel, and only these titles are known to trip over it. Kept in sync with
+    /// _DPI_AWARE_EXES / _DPI_AWARE_TITLE_HINTS in backend_server.py, which stays the
+    /// source of truth for launches that don't come from this sheet.
+    private var defaultDpiAware: Bool {
+        let hidpi = NSScreen.main.map { $0.backingScaleFactor > 1.0 } ?? false
+        guard hidpi else { return false }
+        let hay = (game.name + " " + selectedExe).lowercased()
+        return hay.contains("battlefield 4") || hay.contains("bf4.exe")
+    }
+
+    private var dpiAwareSection: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Toggle(isOn: $dpiAware) {
+                Text(L("HiDPI coordinate fix")).font(.caption).fontWeight(.semibold)
+            }
+            Text(L("On a Retina display Wine reports the screen size and the display-mode list in different units, so some fullscreen games mis-place the mouse or show a black window. Enabled automatically for games known to need it."))
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
     private var metalHudToggle: some View {
         Toggle(isOn: $metalHud) {
             Text(L("Metal HUD")).font(.caption).fontWeight(.semibold)
@@ -427,6 +452,7 @@ struct GameDetailView: View {
         if let a = cfg["args"] as? String { extraArgs = a }
         if let r = cfg["retina_mode"] as? Bool { retinaMode = r }
         if let h = cfg["metal_hud"] as? Bool { metalHud = h }
+        dpiAware = cfg["dpi_aware"] as? Bool ?? defaultDpiAware
         if let gm = cfg["game_mode"] as? Bool { gameMode = gm }
         if let d = cfg["debug"] as? Bool { advancedDebug = d }
         if let e = cfg["esync"] as? Bool { enableEsync = e }
@@ -444,7 +470,10 @@ struct GameDetailView: View {
             "retina_mode": retinaMode, "metal_hud": metalHud, "game_mode": gameMode, "debug": advancedDebug,
             "esync": sync.esync, "msync": sync.msync, "custom_env": customEnv,
             "rosetta_avx": advertiseAVX, "steam_mode": steamMode,
+            "dpi_aware": dpiAware,
         ])
+        // Written separately: "auto" must leave the key ABSENT so the backend's
+        // per-title detection still runs. Sending false would silently disable it.
         await backend.setBottleConfig(path: prefix, values: [
             "rosetta_avx": advertiseAVX, "custom_env": customEnv,
         ])
@@ -528,12 +557,14 @@ struct GameDetailView: View {
                 await backend.epicLaunchGame(
                     prefix: prefix, appName: appName, backend: selectedBackend,
                     retinaMode: retinaMode, metalHud: metalHud, gameMode: gameMode,
-                    esync: sync.esync, msync: sync.msync, customEnv: env, debug: advancedDebug)
+                    esync: sync.esync, msync: sync.msync, customEnv: env, debug: advancedDebug,
+                    dpiAware: dpiAware)
             } else if let amazonId = game.amazonId {
                 await backend.amazonLaunchGame(
                     prefix: prefix, amazonId: amazonId, backend: selectedBackend,
                     retinaMode: retinaMode, metalHud: metalHud, gameMode: gameMode,
-                    esync: sync.esync, msync: sync.msync, customEnv: env, debug: advancedDebug)
+                    esync: sync.esync, msync: sync.msync, customEnv: env, debug: advancedDebug,
+                    dpiAware: dpiAware)
             } else {
                 let exe = effectiveExe
                 guard !exe.isEmpty else { isLaunching = false; return }
@@ -541,7 +572,8 @@ struct GameDetailView: View {
                     prefix: prefix, exe: exe, args: extraArgs, backend: selectedBackend,
                     installDir: game.installDir, retinaMode: retinaMode, metalHud: metalHud, gameMode: gameMode,
                     esync: sync.esync, msync: sync.msync, gameName: game.name,
-                    steamAppId: game.appid, steamMode: steamMode, customEnv: env, debug: advancedDebug)
+                    steamAppId: game.appid, steamMode: steamMode, customEnv: env, debug: advancedDebug,
+                    dpiAware: dpiAware)
             }
             isLaunching = false
             onClose()

@@ -316,7 +316,7 @@ final class BackendClient: ObservableObject {
         }
     }
 
-    func launchGame(prefix: String, exe: String, args: String = "", backend: String = "auto", installDir: String = "", retinaMode: Bool = false, metalHud: Bool = false, gameMode: Bool = true, esync: Bool = true, msync: Bool = true, gameName: String = "", steamAppId: String = "", steamMode: String = "silent", customEnv: String = "", debug: Bool = false, forceDxmtCef: Bool = false) async {
+    func launchGame(prefix: String, exe: String, args: String = "", backend: String = "auto", installDir: String = "", retinaMode: Bool = false, metalHud: Bool = false, gameMode: Bool = true, esync: Bool = true, msync: Bool = true, gameName: String = "", steamAppId: String = "", steamMode: String = "silent", customEnv: String = "", debug: Bool = false, forceDxmtCef: Bool = false, dpiAware: Bool? = nil) async {
         do {
             let screenInfo = NSScreen.screens.map { s in
                 "\(s.localizedName): scale=\(s.backingScaleFactor) res=\(Int(s.frame.width))x\(Int(s.frame.height))"
@@ -328,6 +328,8 @@ final class BackendClient: ObservableObject {
                 "steam_mode": steamMode, "custom_env": customEnv, "debug": debug,
                 "auto_stop_steam": UserDefaults.standard.object(forKey: "auto_stop_steam") as? Bool ?? true,
                 "force_dxmt_cef": forceDxmtCef,
+                // omitted entirely when nil so the backend's per-title detection still runs
+                "dpi_aware": dpiAware as Any? ?? NSNull(),
             ])
             // Backend duplicate-launch guard: the same exe is still alive from a
             // previous launch, so nothing new was spawned. Tell the user what to
@@ -1298,11 +1300,13 @@ final class BackendClient: ObservableObject {
         esync: Bool = true,
         msync: Bool = true,
         customEnv: String = "",
-        debug: Bool = false
+        debug: Bool = false,
+        dpiAware: Bool = false
     ) async {
         do {
             _ = try await send(cmd: "legendary_launch_game", params: [
                 "app_name": appName,
+                "dpi_aware": dpiAware,
                 "prefix": prefix,
                 "backend": backend,
                 "retina_mode": retinaMode,
@@ -1328,7 +1332,8 @@ final class BackendClient: ObservableObject {
         esync: Bool = true,
         msync: Bool = true,
         customEnv: String = "",
-        debug: Bool = false
+        debug: Bool = false,
+        dpiAware: Bool = false
     ) async {
         do {
             _ = try await send(cmd: "nile_launch_game", params: [
@@ -1336,6 +1341,7 @@ final class BackendClient: ObservableObject {
                 "prefix": prefix,
                 "backend": backend,
                 "retina_mode": retinaMode,
+                "dpi_aware": dpiAware,
                 "metal_hud": metalHud,
                 "game_mode": gameMode,
                 "esync": esync,
