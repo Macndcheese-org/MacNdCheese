@@ -691,6 +691,12 @@ def _find_wineserver() -> Optional[str]:
 
 def _find_moltenvk_icd() -> str:
     json_candidates = [
+        # Bundled first: the Homebrew/system paths below only exist if the user happens to
+        # have an x86_64 Vulkan installed. Without this, winevulkan cant even dlopen
+        # libvulkan.1.dylib ("Failed to load libvulkan.1.dylib") and DXVK/VR are dead --
+        # the same missing-x86_64-library trap as freetype n gnutls. Note /opt/homebrew is
+        # ARM MoltenVK, which an x86_64 wine cant use anyway.
+        PORTABLE_DIR / "mnc-vulkan" / "MoltenVK_icd.json",
         Path("/usr/local/share/vulkan/icd.d/MoltenVK_icd.json"),
         Path("/opt/homebrew/share/vulkan/icd.d/MoltenVK_icd.json"),
         Path.home() / ".local" / "share" / "vulkan" / "icd.d" / "MoltenVK_icd.json",
@@ -754,7 +760,7 @@ def _wine_env(prefix: str) -> Dict[str, str]:
         "/usr/local/opt/glib/lib", "/usr/local/opt/gettext/lib",
         "/usr/local/opt/sdl2/lib",
         # bundled freetype/fontconfig fallback for no-Homebrew boxes (see _unified_env / mnc-fonts)
-        str(PORTABLE_DIR / "mnc-fonts"), str(PORTABLE_DIR / "mnc-tls"),
+        str(PORTABLE_DIR / "mnc-fonts"), str(PORTABLE_DIR / "mnc-tls"), str(PORTABLE_DIR / "mnc-vulkan"),
         "/usr/lib",
     ])
 
@@ -3167,7 +3173,7 @@ def _unified_env(prefix: str, game_backend: str, metal_hud: bool = False,
                      # resolve libfreetype (else "Wine cannot find the FreeType font library" +
                      # fontless games). DYLD_FALLBACK matches by leaf name when the Homebrew abs
                      # paths above are absent. After Homebrew so existing dev setups are unchanged.
-                     str(PORTABLE_DIR / "mnc-fonts"), str(PORTABLE_DIR / "mnc-tls"),
+                     str(PORTABLE_DIR / "mnc-fonts"), str(PORTABLE_DIR / "mnc-tls"), str(PORTABLE_DIR / "mnc-vulkan"),
                      "/usr/lib"])
     # Bradar d3dcompiler_47=n,b -> the real MS DLL we provision (native FIRST) with wines weak
     # builtin as fallbak (NEVER native alone, winetricks #2344). mscoree= disables .NET (kills
@@ -9302,6 +9308,7 @@ def main() -> None:
     log(f"MacNCheese backend server started -- app {_app_version()}")
     log(f"unified wine = {_uni if _uni else 'NOT INSTALLED (old pre-unified layout; run Setup)'}")
     log(f"mnc-tls      = {'present' if (PORTABLE_DIR / 'mnc-tls' / 'libgnutls.30.dylib').exists() else 'MISSING (Steam login can fail on a mac with no Homebrew)'}")
+    log(f"mnc-vulkan   = {'present' if (PORTABLE_DIR / 'mnc-vulkan' / 'libvulkan.1.dylib').exists() else 'MISSING (DXVK/VR unavailable on a mac with no Homebrew)'}")
     log(f"PORTABLE_DIR = {PORTABLE_DIR}")
     log(f"BOTTLES_BASE = {BOTTLES_BASE}")
     log(f"DEFAULT_PREFIX = {DEFAULT_PREFIX}")

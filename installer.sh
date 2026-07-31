@@ -2218,6 +2218,7 @@ quick_setup() {
   install_wine_installer
   stage_mnc_fonts
   stage_mnc_tls
+  stage_mnc_vulkan
   install_dxmt
 }
 
@@ -2437,6 +2438,27 @@ stage_mnc_tls() {
     fi
   done
   echo "stage_mnc_tls: no bundled mnc-tls found (Steam login may fail with cert-check errors)"
+}
+
+stage_mnc_vulkan() {
+  # Bundled x86_64 Vulkan loader + MoltenVK ICD -> deps/mnc-vulkan. winevulkan dlopens
+  # libvulkan.1.dylib by bare soname, so with no x86_64 Vulkan installed it fails outright
+  # ("Failed to load libvulkan.1.dylib") and DXVK/VR are dead. We allready ship these libs,
+  # but only inside the VR-only monado-runtime pack, which a normal install never gets.
+  # Note /opt/homebrew Vulkan is ARM and useless to an x86_64 wine, so a Homebrew check is
+  # not enough on its own.
+  local dst src
+  dst="${PORTABLE_DIR}/mnc-vulkan"
+  for src in "${MNC_VULKAN_SRC:-}" "${RESOURCES_DIR:-}/mnc-vulkan" "$(dirname "$0")/mnc-vulkan"; do
+    if [ -n "$src" ] && [ -f "$src/libvulkan.1.dylib" ]; then
+      rm -rf "$dst"; mkdir -p "$dst"
+      cp -R "$src"/* "$dst"/ 2>/dev/null
+      xattr -dr com.apple.quarantine "$dst" 2>/dev/null || true
+      echo "stage_mnc_vulkan: staged Vulkan loader + MoltenVK -> deps/mnc-vulkan"
+      return 0
+    fi
+  done
+  echo "stage_mnc_vulkan: no bundled mnc-vulkan found (DXVK/VR may be unavailable)"
 }
 
 stage_unified_d3d_pack() {
