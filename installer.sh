@@ -2217,6 +2217,7 @@ quick_setup() {
   install_wine_unified
   install_wine_installer
   stage_mnc_fonts
+  stage_mnc_tls
   install_dxmt
 }
 
@@ -2415,6 +2416,27 @@ stage_mnc_fonts() {
     fi
   done
   echo "stage_mnc_fonts: no bundled mnc-fonts found (no-Homebrew boxes may hit the FreeType error)"
+}
+
+stage_mnc_tls() {
+  # Bundled x86_64 gnutls closure -> deps/mnc-tls, the exact same trick mnc-fonts pulls for
+  # freetype. Without a gnutls that an x86_64 wine can actualy dlopen, crypt32/bcrypt cant
+  # verify a certificate signature, so Steam logs "Crypto API failed certificate check, error
+  # flags 0x00000008" forever and the login sits on WaitingForServerResponse. It used to be
+  # sourced from Wine Stable.app, but that is NOT installed by default, so a box with neither
+  # it nor Intel Homebrew had no TLS at all.
+  local dst src
+  dst="${PORTABLE_DIR}/mnc-tls"
+  for src in "${MNC_TLS_SRC:-}" "${RESOURCES_DIR:-}/mnc-tls" "$(dirname "$0")/mnc-tls"; do
+    if [ -n "$src" ] && [ -f "$src/libgnutls.30.dylib" ]; then
+      rm -rf "$dst"; mkdir -p "$dst"
+      cp -R "$src"/*.dylib "$dst"/ 2>/dev/null
+      xattr -dr com.apple.quarantine "$dst" 2>/dev/null || true
+      echo "stage_mnc_tls: staged $(ls "$dst"/*.dylib 2>/dev/null | wc -l | tr -d ' ') TLS libs -> deps/mnc-tls"
+      return 0
+    fi
+  done
+  echo "stage_mnc_tls: no bundled mnc-tls found (Steam login may fail with cert-check errors)"
 }
 
 stage_unified_d3d_pack() {

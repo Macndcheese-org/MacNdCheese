@@ -52,7 +52,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 
 PORTABLE_DIR = Path.home() / "Library" / "Application Support" / "MacNCheese" / "deps"
-# x86_64 TLS closure (libgnutls.30 + nettle/hogweed/gmp/tasn1/p11-kit/intl...) for the
+# x86_64 TLS closure. PRIMARY source is the bundled deps/mnc-tls pack (see stage_mnc_tls),
+# same idea as mnc-fonts for freetype. The Wine-Stable path below is only a FALLBACK: it is
+# NOT installed by default, so relying on it alone left boxes with no gnutls at all ->
+# crypt32/bcrypt cant verify a cert signature -> Steam login sits on WaitingForServerResponse.
+# (libgnutls.30 + nettle/hogweed/gmp/tasn1/p11-kit/intl...) for the
 # wine-unified build. it was only ever found via /usr/local/opt/gnutls/lib = INTEL homebrew,
 # which does NOT exist on a normal Apple-Silicon mac (only /opt/homebrew, useless to an x86_64
 # wine). without it wine loads with NO encryption (gnutls_process_attach fails -> no schannel ->
@@ -750,7 +754,7 @@ def _wine_env(prefix: str) -> Dict[str, str]:
         "/usr/local/opt/glib/lib", "/usr/local/opt/gettext/lib",
         "/usr/local/opt/sdl2/lib",
         # bundled freetype/fontconfig fallback for no-Homebrew boxes (see _unified_env / mnc-fonts)
-        str(PORTABLE_DIR / "mnc-fonts"),
+        str(PORTABLE_DIR / "mnc-fonts"), str(PORTABLE_DIR / "mnc-tls"),
         "/usr/lib",
     ])
 
@@ -3163,7 +3167,7 @@ def _unified_env(prefix: str, game_backend: str, metal_hud: bool = False,
                      # resolve libfreetype (else "Wine cannot find the FreeType font library" +
                      # fontless games). DYLD_FALLBACK matches by leaf name when the Homebrew abs
                      # paths above are absent. After Homebrew so existing dev setups are unchanged.
-                     str(PORTABLE_DIR / "mnc-fonts"),
+                     str(PORTABLE_DIR / "mnc-fonts"), str(PORTABLE_DIR / "mnc-tls"),
                      "/usr/lib"])
     # Bradar d3dcompiler_47=n,b -> the real MS DLL we provision (native FIRST) with wines weak
     # builtin as fallbak (NEVER native alone, winetricks #2344). mscoree= disables .NET (kills
