@@ -676,6 +676,17 @@ struct EmptyBottleLandingView: View {
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.large)
+
+                // This landing replaces the whole library pane, so without this
+                // button a bottle holding only applications (a launcher bottle
+                // before any game is installed) had no reachable way to add or
+                // see one -- the Applications section lives behind the grid,
+                // which never renders while both lists are empty.
+                Button(L("Add Application")) {
+                    addManualApp()
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.large)
             }
             Spacer()
         }
@@ -708,6 +719,21 @@ struct EmptyBottleLandingView: View {
            let prefix = backend.activePrefix {
             let name = url.deletingPathExtension().lastPathComponent
             Task { await backend.addManualGame(prefix: prefix, name: name, exe: url.path) }
+        }
+    }
+
+    private func addManualApp() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.exe]
+        panel.canChooseFiles = true
+        panel.title = L("Select Application EXE")
+        if panel.runModal() == .OK, let url = panel.url,
+           let prefix = backend.activePrefix {
+            let name = url.deletingPathExtension().lastPathComponent
+            Task {
+                await backend.addManualApp(prefix: prefix, name: name, exe: url.path)
+                await backend.scanApps(prefix: prefix)
+            }
         }
     }
 }

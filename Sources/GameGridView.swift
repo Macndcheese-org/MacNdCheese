@@ -1,6 +1,22 @@
 import SwiftUI
 import UniformTypeIdentifiers
 
+/// The two halves of a bottle's library. They used to be stacked vertically in
+/// one scroll view, which meant reaching the apps required scrolling past every
+/// game — and on a bottle with no games at all the apps section was not
+/// reachable from the landing state at all.
+enum LibrarySection: String, CaseIterable, Identifiable {
+    case games, apps
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .games: return L("Games")
+        case .apps: return L("Applications")
+        }
+    }
+}
+
 struct GameGridView: View {
     @EnvironmentObject var backend: BackendClient
     let games: [Game]
@@ -12,6 +28,10 @@ struct GameGridView: View {
     @State private var draggingAppid: String? = nil
     @State private var dropTargetAppid: String? = nil
     @State private var isRefreshing = false
+    /// nil = follow the content (see effectiveSection). Set once the user
+    /// picks a tab by hand, so an explicit choice is never overridden by a
+    /// background rescan landing new games/apps in the bottle.
+    @State private var pickedSection: LibrarySection? = nil
 
     private var activeBottle: Bottle? {
         guard let prefix = backend.activePrefix else { return nil }
@@ -38,6 +58,49 @@ struct GameGridView: View {
             : orderedGames.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
     }
 
+    private var displayedApps: [WineApp] {
+        searchText.isEmpty
+            ? backend.apps
+            : backend.apps.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
+    }
+
+    /// Which tab is actually showing. Until the user picks one, follow whatever
+    /// the bottle has: a launcher bottle with apps but no games yet opens on
+    /// Apps rather than on an empty grid.
+    ///
+    /// Keyed off backend.games, not the `games` we were handed -- that one is
+    /// already search-filtered upstream, so typing a query no game matches
+    /// would otherwise yank the user over to the Apps tab mid-search.
+    private var effectiveSection: LibrarySection {
+        if let pickedSection { return pickedSection }
+        return backend.games.isEmpty && !backend.apps.isEmpty ? .apps : .games
+    }
+
+    private var sectionBinding: Binding<LibrarySection> {
+        Binding(get: { effectiveSection }, set: { pickedSection = $0 })
+    }
+
+    private func sectionCount(_ section: LibrarySection) -> Int {
+        section == .games ? backend.games.count : backend.apps.count
+    }
+
+    @ViewBuilder
+    private var sectionSwitcher: some View {
+        Picker("", selection: sectionBinding) {
+            ForEach(LibrarySection.allCases) { section in
+                // Counts are of everything in the bottle, not of the current
+                // search results — a "Games 12" that drops to "Games 0" while
+                // typing reads as if the library emptied out.
+                Text("\(section.title)  \(sectionCount(section))").tag(section)
+            }
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        .frame(maxWidth: 320)
+        .padding(.horizontal, 24)
+        .padding(.top, 12)
+    }
+
     private var launcherName: String {
         guard let bottle = activeBottle else { return "Steam" }
         if let exe = bottle.launcherExe, !exe.isEmpty {
@@ -49,7 +112,45 @@ struct GameGridView: View {
     @ViewBuilder
     private var scrollContent: some View {
         ScrollView {
-            LazyVGrid(columns: columns, spacing: 16) {
+            switch effectiveSection {
+            case .games: gamesGrid
+            case .apps: appsSection
+            }
+        }
+        .contentMarginsTopCompat(20)
+        .scrollClipDisabledCompat()
+    }
+
+    @ViewBuilder
+    private var appsSection: some View {
+        // The switcher above already names the section, so let it drop its own
+        // heading — but keep its Winetricks / Add Application buttons, which
+        // are the only way to put a first app in a freshly created bottle.
+        AppsSectionView(apps: displayedApps, showsTitle: false)
+            .padding(.bottom, 24)
+
+        if displayedApps.isEmpty {
+            emptySectionHint(
+                icon: "app.dashed",
+                message: backend.apps.isEmpty
+                    ? L("No applications in this bottle yet. Use Add Application to point at a Windows .exe.")
+                    : L("No applications match your search.")
+            )
+        }
+    }
+
+    @ViewBuilder
+    private var gamesGrid: some View {
+        if displayedGames.isEmpty {
+            emptySectionHint(
+                icon: "gamecontroller",
+                message: backend.games.isEmpty
+                    ? L("No games in this bottle yet.")
+                    : L("No games match your search.")
+            )
+        }
+
+        LazyVGrid(columns: columns, spacing: 16) {
                 ForEach(displayedGames) { game in
                     GameCardView(
                         game: game,
@@ -84,20 +185,25 @@ struct GameGridView: View {
                         draggingAppid = nil
                         return true
                     }
-                }
-            }
-            .padding(.horizontal, 24)
-            .padding(.bottom, 24)
-
-            // Bradar always show the Applications section (even empty) so the Add Application
-            // button is there to add the FIRST app, not only after some got auto-scanned
-            if backend.activePrefix != nil {
-                AppsSectionView(apps: backend.apps)
-                    .padding(.bottom, 24)
             }
         }
-        .contentMarginsTopCompat(20)
-        .scrollClipDisabledCompat()
+        .padding(.horizontal, 24)
+        .padding(.bottom, 24)
+    }
+
+    private func emptySectionHint(icon: String, message: String) -> some View {
+        VStack(spacing: 10) {
+            Image(systemName: icon)
+                .font(.system(size: 34))
+                .foregroundStyle(.tertiary)
+            Text(message)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.horizontal, 24)
+        .padding(.vertical, 36)
     }
 
     @ViewBuilder
@@ -110,7 +216,11 @@ struct GameGridView: View {
     }
 
     var body: some View {
-        gameScrollView
+        VStack(spacing: 0) {
+            sectionSwitcher
+            gameScrollView
+        }
+        .animation(.easeInOut(duration: 0.18), value: effectiveSection)
         .toolbar {
             ToolbarItem(placement: .navigation) {
                 if let bottle = activeBottle,
@@ -506,6 +616,9 @@ struct GameCardView: View {
 struct AppsSectionView: View {
     @EnvironmentObject var backend: BackendClient
     let apps: [WineApp]
+    /// Suppressed when the Games/Apps switcher already labels the section;
+    /// the action buttons in the same row are kept either way.
+    var showsTitle: Bool = true
     @State private var showWinetricksStore = false
 
     private let columns = [
@@ -515,8 +628,10 @@ struct AppsSectionView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Text("Applications")
-                    .font(.headline)
+                if showsTitle {
+                    Text("Applications")
+                        .font(.headline)
+                }
                 Spacer()
                 Button { showWinetricksStore = true } label: {
                     Label(L("Winetricks App Store"), systemImage: "shippingbox")
