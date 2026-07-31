@@ -760,7 +760,7 @@ def _wine_env(prefix: str) -> Dict[str, str]:
         "/usr/local/opt/glib/lib", "/usr/local/opt/gettext/lib",
         "/usr/local/opt/sdl2/lib",
         # bundled freetype/fontconfig fallback for no-Homebrew boxes (see _unified_env / mnc-fonts)
-        str(PORTABLE_DIR / "mnc-fonts"), str(PORTABLE_DIR / "mnc-tls"), str(PORTABLE_DIR / "mnc-vulkan"),
+        str(PORTABLE_DIR / "mnc-fonts"), str(PORTABLE_DIR / "mnc-tls"), str(PORTABLE_DIR / "mnc-vulkan"), str(PORTABLE_DIR / "mnc-sdl"),
         "/usr/lib",
     ])
 
@@ -3173,7 +3173,7 @@ def _unified_env(prefix: str, game_backend: str, metal_hud: bool = False,
                      # resolve libfreetype (else "Wine cannot find the FreeType font library" +
                      # fontless games). DYLD_FALLBACK matches by leaf name when the Homebrew abs
                      # paths above are absent. After Homebrew so existing dev setups are unchanged.
-                     str(PORTABLE_DIR / "mnc-fonts"), str(PORTABLE_DIR / "mnc-tls"), str(PORTABLE_DIR / "mnc-vulkan"),
+                     str(PORTABLE_DIR / "mnc-fonts"), str(PORTABLE_DIR / "mnc-tls"), str(PORTABLE_DIR / "mnc-vulkan"), str(PORTABLE_DIR / "mnc-sdl"),
                      "/usr/lib"])
     # Bradar d3dcompiler_47=n,b -> the real MS DLL we provision (native FIRST) with wines weak
     # builtin as fallbak (NEVER native alone, winetricks #2344). mscoree= disables .NET (kills
@@ -9309,6 +9309,7 @@ def main() -> None:
     log(f"unified wine = {_uni if _uni else 'NOT INSTALLED (old pre-unified layout; run Setup)'}")
     log(f"mnc-tls      = {'present' if (PORTABLE_DIR / 'mnc-tls' / 'libgnutls.30.dylib').exists() else 'MISSING (Steam login can fail on a mac with no Homebrew)'}")
     log(f"mnc-vulkan   = {'present' if (PORTABLE_DIR / 'mnc-vulkan' / 'libvulkan.1.dylib').exists() else 'MISSING (DXVK/VR unavailable on a mac with no Homebrew)'}")
+    log(f"mnc-sdl      = {'present' if (PORTABLE_DIR / 'mnc-sdl' / 'libSDL2-2.0.0.dylib').exists() else 'MISSING (game controllers wont work without Homebrew)'}")
     log(f"PORTABLE_DIR = {PORTABLE_DIR}")
     log(f"BOTTLES_BASE = {BOTTLES_BASE}")
     log(f"DEFAULT_PREFIX = {DEFAULT_PREFIX}")

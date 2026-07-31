@@ -2219,6 +2219,7 @@ quick_setup() {
   stage_mnc_fonts
   stage_mnc_tls
   stage_mnc_vulkan
+  stage_mnc_sdl
   install_dxmt
 }
 
@@ -2459,6 +2460,25 @@ stage_mnc_vulkan() {
     fi
   done
   echo "stage_mnc_vulkan: no bundled mnc-vulkan found (DXVK/VR may be unavailable)"
+}
+
+stage_mnc_sdl() {
+  # Bundled x86_64 SDL2 -> deps/mnc-sdl. wine dlopens libSDL2-2.0.0.dylib for gamepad/
+  # controller support, so without an x86_64 SDL2 on the path controllers just silently
+  # dont work -- no error, which is why nobody reported it. Last of the four libraries
+  # wine asks for by bare soname (freetype, gnutls, vulkan, SDL2).
+  local dst src
+  dst="${PORTABLE_DIR}/mnc-sdl"
+  for src in "${MNC_SDL_SRC:-}" "${RESOURCES_DIR:-}/mnc-sdl" "$(dirname "$0")/mnc-sdl"; do
+    if [ -n "$src" ] && [ -f "$src/libSDL2-2.0.0.dylib" ]; then
+      rm -rf "$dst"; mkdir -p "$dst"
+      cp -R "$src"/* "$dst"/ 2>/dev/null
+      xattr -dr com.apple.quarantine "$dst" 2>/dev/null || true
+      echo "stage_mnc_sdl: staged SDL2 -> deps/mnc-sdl"
+      return 0
+    fi
+  done
+  echo "stage_mnc_sdl: no bundled mnc-sdl found (controllers may not work)"
 }
 
 stage_unified_d3d_pack() {
