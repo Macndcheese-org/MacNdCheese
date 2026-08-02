@@ -3578,7 +3578,17 @@ def _unified_env(prefix: str, game_backend: str, metal_hud: bool = False,
     # builtin mshtml still can't render anything without a Gecko package to point at.
     _mscoree = "" if needs_dotnet else "mscoree=;"
     _mshtml = "" if needs_dotnet else "mshtml=;"
-    dll_ovr = f"winemenubuilder.exe=d;{_mscoree}{_mshtml}d3dcompiler_47=n,b;nvapi,nvapi64="
+    # Bradar msvcp140_2 + vcruntime140_1 native: UE bootstrappers (BootstrapPackagedGame)
+    # dont trust the VC\Runtimes reg keys -- they read the VERSION RESOURCE of those two
+    # DLLs in system32 n compare it to the redist they ship. wines builtins r stamped
+    # 14.42.34433, so a game shippin 14.42.34438 (Satisfactory) allways fails the check,
+    # pops "Microsoft Visual C++ 2015-2022 Redistributable (x64) is required" n then its
+    # vc_redist.x64.exe Burn bundle fault-storms at 100% CPU forever under the HACK22 wine
+    # = launch wedged w/ no window. The real MS DLLs r allready in system32 (the redist
+    # installs them), so prefer em; ",b" keeps wines builtin as fallback on prefixes that
+    # dont have em, which behaves exactly as before.
+    dll_ovr = (f"winemenubuilder.exe=d;{_mscoree}{_mshtml}d3dcompiler_47=n,b;"
+               f"msvcp140_2,vcruntime140_1=n,b;nvapi,nvapi64=")
     env.update({
         "WINEPREFIX": str(prefix),
         # msync OFF by default. The bundled unified wine is msync-capable (server
@@ -4690,6 +4700,46 @@ def _run_shared_commonredist(prefix: str, backend: str) -> None:
         log(f"shared redist: processd {handled} uncoverd CommonRedist redist(s) via pre-HACK22 wine")
 
 
+def _ue_project_token(exe_path: Path, args: str) -> str:
+    """The project name a packaged Unreal game needs as its FIRST argument, or "".
+
+    UE derives the project from the exes OWN name: <Project>-Win64-Shipping.exe looks for
+    ../../../<Project>/<Project>.uproject. When the shipped exe is named after the store
+    build insted of the project -- Satisfactory ships FactoryGameSteam-Win64-Shipping.exe
+    inside a FactoryGame project -- that lookup misses n the game dies in a modal "Failed
+    to open descriptor file ../../../FactoryGameSteam/FactoryGameSteam.uproject" before it
+    ever opens a window, so Play just looks broken. The games own bootstrap exe passes the
+    real name ("FactoryGame -NO_EOS_OVERLAY"), so do the same when we launch the shipping
+    exe directly. Only fires when the exes own name does NOT resolve, so games that allready
+    work r untouched, n bails out whenever the layout is unfamiliar rather than guessin."""
+    m = re.match(r"(.+?)-Win64-(?:Shipping|Test|Development|DebugGame)$", exe_path.stem, re.I)
+    if not m:
+        return ""
+    exe_project = m.group(1)
+    # demand the canonical <root>/Engine/Binaries/Win64/<exe> layout
+    if (len(exe_path.parents) < 4
+            or exe_path.parents[1].name.lower() != "binaries"
+            or exe_path.parents[2].name.lower() != "engine"):
+        return ""
+    root = exe_path.parents[3]
+    own = root / exe_project
+    if (own / f"{exe_project}.uproject").exists() or (own / "Content").is_dir():
+        return ""   # the exes own name resolves -> UE finds the project by itself
+    # never override a project token the frontend/user allready put first
+    try:
+        first = next(iter(shlex.split(args)), "")
+    except ValueError:
+        return ""   # unbalanced quotes -- leave the argv exactly as given
+    if first and not first.startswith(("-", "/")):
+        return ""
+    try:
+        cands = sorted(d.name for d in root.iterdir()
+                       if d.is_dir() and d.name.lower() != "engine" and (d / "Content").is_dir())
+    except OSError:
+        return ""
+    return cands[0] if len(cands) == 1 else ""   # ambiguous -> dont guess
+
+
 def _launch_game_unified(prefix: str, exe: str, args: str, bottle_cfg: Dict[str, Any],
                          params: Dict[str, Any]) -> Any:
     """Launch a game through the unified wine; the loader routes its d3d to the
@@ -4854,6 +4904,11 @@ def _launch_game_unified(prefix: str, exe: str, args: str, bottle_cfg: Dict[str,
         if _add:
             args = ((args + " ") if args else "") + " ".join(_add)
             log(f"CEF-safe-mode Application: appended {len(_add)} CEF/GPU switch(es) to argv")
+    _ue_project = _ue_project_token(exe_path, args)
+    if _ue_project:
+        args = f"{_ue_project} {args}".strip()
+        log(f"UE: prepended project '{_ue_project}' -- {exe_path.name} doesnt resolve to a "
+            f"project dir, so UE would die on 'Failed to open descriptor file'")
     quoted_args = (" " + args) if args else ""
     cmd = (
         # export DYLD inside the shell. the outer arch (SIP-restricted) strips DYLD_* so
