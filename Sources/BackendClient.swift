@@ -376,7 +376,14 @@ final class BackendClient: ObservableObject {
     @Published var eaAppInstallStep = ""
 
     func launchLauncher(prefix: String) async {
-        let retinaMode = NSScreen.main.map { $0.backingScaleFactor > 1.0 } ?? false
+        // The bottle's own Retina checkbox is the source of truth, same as every
+        // launchGame() caller (SettingsSheet/GameDetailView/GameGridView all read
+        // config["retina_mode"]). Deriving it from the display alone means a bottle that
+        // deliberately turned Retina OFF still gets a 192-DPI launcher. Fall back to the
+        // real display's backing scale factor only when the bottle has no override.
+        let cfg = await getBottleConfig(path: prefix)
+        let retinaMode = cfg?["retina_mode"] as? Bool
+            ?? (NSScreen.main.map { $0.backingScaleFactor > 1.0 } ?? false)
         do {
             let result = try await send(cmd: "launch_launcher", params: [
                 "prefix": prefix, "retina_mode": retinaMode
@@ -394,7 +401,11 @@ final class BackendClient: ObservableObject {
     }
 
     func launchSteam(prefix: String) async {
-        let retinaMode = NSScreen.main.map { $0.backingScaleFactor > 1.0 } ?? false
+        // Same as launchLauncher above: honour the bottle's retina_mode instead of forcing
+        // it from the display, so turning Retina off for a bottle actually reaches Steam.
+        let cfg = await getBottleConfig(path: prefix)
+        let retinaMode = cfg?["retina_mode"] as? Bool
+            ?? (NSScreen.main.map { $0.backingScaleFactor > 1.0 } ?? false)
         do {
             let result = try await send(cmd: "launch_steam", params: [
                 "prefix": prefix, "retina_mode": retinaMode,
