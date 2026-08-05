@@ -537,7 +537,7 @@ struct SteamLandingView: View {
                     if panel.runModal() == .OK, let url = panel.url,
                        let prefix = backend.activePrefix {
                         Task {
-                            // installers run through run_exe -> the pre-HACK22 installer-wine
+                            // installers run through run_exe -> the unified installer wine
                             // overlay (NOT launchGame/the unified HACK22 wine, which fault-storms
                             // on 32-bit NSIS/Burn installers like SteamSetup).
                             await backend.runExe(prefix: prefix, exe: url.path)
@@ -664,7 +664,7 @@ struct EmptyBottleLandingView: View {
                     panel.canChooseFiles = true
                     if panel.runModal() == .OK, let url = panel.url,
                        let prefix = backend.activePrefix {
-                        // run_exe -> pre-HACK22 installer-wine overlay (see the other Run Installer button)
+                        // run_exe -> the unified installer wine (see the other Run Installer button)
                         Task { await backend.runExe(prefix: prefix, exe: url.path) }
                     }
                 }

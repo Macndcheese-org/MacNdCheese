@@ -17,9 +17,9 @@ final class WineVersionGate: ObservableObject {
     @Published var failed = false
 
     /// wine components refreshed when the app version moves forward. Each is a real
-    /// installer.sh ACTION. install_wine_installer rebuilds the pre-HACK22 installer
-    /// overlay so 32-bit installers keep runnin after a wine bump.
-    private let wineActions = ["install_wine_unified", "install_wine_installer", "stage_mnc_fonts", "install_dxmt"]
+    /// installer.sh ACTION. The pre-HACK22 installer overlay used to be rebuilt here too;
+    /// it is gone — installers run on the unified engine now.
+    private let wineActions = ["install_wine_unified", "stage_mnc_fonts", "install_dxmt"]
 
     static var markerPath: String { MacNCheeseSupport.directory + "/wine_version" }
 

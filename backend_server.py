@@ -684,9 +684,11 @@ def _find_wine_for_bottle(wine_binary_pref: str = "auto") -> Optional[str]:
 def _find_wine() -> Optional[str]:
     ubt = _unified_build_dir()
     candidates = [
+        # the unified engine is the one we build, patch and test against -- prefer it over
+        # any stock Wine Stable / Staging install that happens to be lying around.
+        str(ubt / "wine") if ubt else None,
         _find_wine_stable(),
         _find_wine_staging(),
-        str(ubt / "wine") if ubt else None,
         str(PORTABLE_DIR / "bin" / "wine64"),
         str(PORTABLE_DIR / "bin" / "wine"),
         shutil.which("wine64"),
@@ -3199,7 +3201,7 @@ def _provision_redist_dlls(prefix: str) -> None:
 
 def _install_wine_mono(prefix: str, backend: str = "d3dmetal") -> bool:
     """Install wine-mono (the .NET Framework substitute) into a prefix from the bundled MSI,
-    via the PRE-HACK22 overlay wine -- a plain 'msiexec /i', NOT the real MS .NET NDP*.exe
+    via the unified wine -- a plain 'msiexec /i', NOT the real MS .NET NDP*.exe
     bootstrapper (that one fault-storms forever under HACK22 n never exits, which is the whole
     reason .NET "installers" appeard broken). Once-per-prefix, guarded by the drive_c/windows/
     mono sentinel. Returns True if mono is present (allready-there or freshly installd).
@@ -3214,20 +3216,20 @@ def _install_wine_mono(prefix: str, backend: str = "d3dmetal") -> bool:
     msis = sorted((src / "wine-mono").glob("wine-mono-*.msi")) if (src / "wine-mono").is_dir() else []
     if not msis:
         return False
-    iw = _prehack22_wine()
+    iw = _installer_wine()
     if not iw:
-        log("redist: wine-mono install skipd (no pre-HACK22 overlay wine)")
+        log("redist: wine-mono install skipd (no wine found)")
         return False
     msi = str(msis[-1])   # newest cached
     env = _unified_env(prefix, backend or "d3dmetal", False, for_steam=False)
     env["WINEDEBUG"] = "-all"
     # mscoree MUST be enabled for msiexec to register mono -> drop it from the override here
     env["WINEDLLOVERRIDES"] = "winemenubuilder.exe=d;mshtml="
-    _stage_syswow64(prefix)   # 32-bit subsystem so the overlay wine can run the 32-bit MSI
+    _stage_syswow64(prefix)   # 32-bit subsystem so the wine can run the 32-bit MSI
     dyld = env.get("DYLD_FALLBACK_LIBRARY_PATH", "")
     sh = (f"export DYLD_FALLBACK_LIBRARY_PATH={shlex.quote(dyld)}\n"
           f"{shlex.quote(iw)} msiexec /i {shlex.quote(msi)} /qn >/dev/null 2>&1")
-    log(f"redist: installing {Path(msi).name} (wine-mono / .NET) via pre-HACK22 wine...")
+    log(f"redist: installing {Path(msi).name} (wine-mono / .NET) via the unified wine...")
     try:
         subprocess.run(["/usr/bin/arch", "-x86_64", "/bin/bash", "-lc", sh], env=env, timeout=600)
     except Exception as exc:
@@ -4378,58 +4380,47 @@ def _ensure_progfiles_x86(prefix: str) -> None:
         log(f"_ensure_progfiles_x86 failed: {exc}")
 
 
-def _prehack22_wine() -> str:
-    """Loader for the PRE-HACK22 wine (stock gs.base swap), used ONLY to run WoW64 redist
-    installers (vc_redist / VulkanRT / Rockstar-Games-Launcher + Social-Club Burn bundles /
-    .NET) that fault-storm at ~100% CPU forEVER under the unified wines HACK22 gs.base
-    rewrite -- HACK22 breaks the WoW64 32<->64 transition so those 32-bit Burn engines jump
-    to garbage n spin ("stuck on installer script"). the pre-HACK22 wine runs them clean.
-    Steam + the actual games keep the unified HACK22 wine. See winemono-32bit-hack22-rootcause."""
-    cands = []
+def _installer_wine() -> str:
+    """The wine to run installers with: the unified engine, always.
+
+    This replaces the old pre-HACK22 overlay (deps/wine-installer). That overlay existed
+    because 32-bit NSIS/Burn stubs fault-stormed at ~100% CPU under HACK 22's gs.base
+    rewrite. Root-caused 2026-07-25: the far `ljmp` in dlls/wow64cpu/cpu.c's syscall_32to64
+    did not switch the CPU to 64-bit mode under Rosetta 2, so the 64-bit body decoded as
+    32-bit and faulted (CW HACK 20760). With that fixed the unified engine runs 32-bit Burn
+    bundles clean -- EA App's own installer reaches "Apply complete, result: 0x0" -- so the
+    overlay is retired and installers use the same engine as everything else.
+
+    MNC_INSTALLER_WINE still overrides, for bisecting an installer against another build."""
     ov = os.environ.get("MNC_INSTALLER_WINE", "").strip()
-    if ov:
-        cands.append(Path(ov))
-    cands += [
-        PORTABLE_DIR / "wine-installer" / "wine",                                 # overlay clone (install_wine_installer)
-        PORTABLE_DIR / "wine-installer" / "tools" / "wine" / "wine",              # overlay clone (direct loader)
-        PORTABLE_DIR / "wine-installer" / "build64" / "tools" / "wine" / "wine",  # bundled build-tree (older shape)
-        PORTABLE_DIR / "wine-installer" / "bt" / "wine",
-        Path("/Volumes/ASAFE/D3DMETALWINEDEV/wt-pre-hack22/build64/tools/wine/wine"),  # dev worktree
-    ]
-    for c in cands:
-        try:
-            if c.exists():
-                return str(c)
-        except Exception:
-            continue
-    return ""
+    if ov and Path(ov).exists():
+        return ov
+    bt = _unified_build_dir()
+    if bt:
+        return str(bt / "wine")
+    return _find_wine() or ""
 
 
 def _run_installer_unified(prefix: str, cmd_after_wine: List[str],
                            backend: str = "dxmt",
                            log_path: Optional[str] = None,
                            env: Optional[Dict[str, str]] = None) -> subprocess.Popen:
-    """Launch an installer on the UNIFIED wine -- the pre-HACK22 overlay's replacement.
+    """Launch an installer on the UNIFIED wine. This is the only installer path.
 
-    The whole reason _run_installer_prehack22 exists is that 32-bit NSIS/Burn stubs used to
-    fault-storm under the unified engine. That was root-caused 2026-07-25: the far `ljmp` in
-    dlls/wow64cpu/cpu.c's syscall_32to64 does not switch the CPU to 64-bit mode under
-    Rosetta 2, so the 64-bit body decoded as 32-bit and faulted (CW HACK 20760, now ported).
-    With that fixed, a 32-bit Burn bundle runs clean on the unified wine -- EA App's own
-    installer reaches "Apply complete, result: 0x0" -- so new callers should come here and
-    the overlay can be retired rather than grown.
+    A pre-HACK22 overlay used to exist because 32-bit NSIS/Burn stubs fault-stormed under
+    the unified engine. Root-caused 2026-07-25: the far `ljmp` in dlls/wow64cpu/cpu.c's
+    syscall_32to64 did not switch the CPU to 64-bit mode under Rosetta 2, so the 64-bit body
+    decoded as 32-bit and faulted (CW HACK 20760, now ported). With that fixed a 32-bit Burn
+    bundle runs clean here -- EA App's own installer reaches "Apply complete, result:
+    0x0" -- and the overlay has been removed.
 
-    Same mechanics as the overlay path: stage a real 32-bit subsystem first (a fast-booted
+    Stage a real 32-bit subsystem first (a fast-booted
     bottle with an empty syswow64 kills 32-bit installers with c0000135), run under
     arch -x86_64 with an in-shell DYLD re-export (arch strips DYLD_*), and tee wine's output
     to log_path so an install is never a silent black box."""
-    bt = _unified_build_dir()
-    if not bt:
-        # the unified engine is optional (Setup tab) -- a bottle on the classic engine still
-        # has to be able to install things, so keep the old chain rather than hard-failing
-        log("installer: unified wine not installed -> pre-HACK22/Wine-Stable installer path")
-        return _run_installer_prehack22(prefix, cmd_after_wine, backend,
-                                        log_path=log_path, env=env)
+    wine = _installer_wine()
+    if not wine:
+        raise FileNotFoundError("Wine not found")
     if env is None:
         env = _unified_env(prefix, backend or "dxmt", False, for_steam=False)
         env["WINEDEBUG"] = "-all,+err"
@@ -4437,7 +4428,6 @@ def _run_installer_unified(prefix: str, cmd_after_wine: List[str],
     _ensure_progfiles_x86(prefix)
     _stage_unified_dlls(prefix)
     out = open(log_path, "w") if log_path else subprocess.DEVNULL
-    wine = str(bt / "wine")
     dyld = env.get("DYLD_FALLBACK_LIBRARY_PATH", "")
     tail = " ".join(shlex.quote(a) for a in cmd_after_wine)
     sh = (f"export DYLD_FALLBACK_LIBRARY_PATH={shlex.quote(dyld)}\n"
@@ -4448,68 +4438,15 @@ def _run_installer_unified(prefix: str, cmd_after_wine: List[str],
                             start_new_session=True)
 
 
-def _run_installer_prehack22(prefix: str, cmd_after_wine: List[str],
-                             backend: str = "d3dmetal",
-                             log_path: Optional[str] = None,
-                             env: Optional[Dict[str, str]] = None) -> subprocess.Popen:
-    """Launch a WoW64/32-bit installer (SteamSetup, generic .exe/.msi installers)
-    via the PRE-HACK22 wine. Steams NSIS stub -- n other 32-bit NSIS/Burn installer
-    stubs -- jump to garbage n fault-storm at 100% CPU under the unified wines HACK22
-    gs.base rewrite (it breaks the WoW64 32<->64 transition). from the UI that looks
-    like the installer never launchs: the stub faults BEFOR it ever opens a window,
-    n with output to /dev/null it writes no logs eithr. the pre-HACK22 wine runs them
-    clean, same as the redist pre-install path (_run_installscript_redists). uses
-    arch-x86_64 + an in-shell DYLD re-export becuse arch strips DYLD_*. wine output is
-    teed to log_path so "Run Installer" isnt a silent black box. Falls back to the
-    unified wine only when the pre-HACK22 wine isnt bundled (may then fault-storm).
-    Callers that need a SPECIFIC env pass `env` to OVERRIDE the default -- e.g. the EA app,
-    which needs mscoree ENABLED + GStreamer STRIPPED (the default for_steam=False env would
-    wrongly disable mscoree n wire GStreamer into a CEF app)."""
-    if env is None:
-        env = _unified_env(prefix, backend or "d3dmetal", False, for_steam=False)
-        env["WINEDEBUG"] = "-all,+err"  # errors only: bounded log but catchs real crashs / missing DLLs
-    # the pre-HACK22 overlay wine (n the Wine-Stable fallback) have no MNC_SKIP_WOW64_INSTALL hack,
-    # so a fast-booted bottle (empty syswow64) makes 32-bit installers die c0000135. give it a real
-    # 32-bit subsystem first (fast clonefile, idempotent). THIS is why "Run Installer" was failing.
-    _stage_syswow64(prefix)
-    _ensure_progfiles_x86(prefix)
-    out = open(log_path, "w") if log_path else subprocess.DEVNULL
-    iw = _prehack22_wine()
-    if iw:
-        dyld = env.get("DYLD_FALLBACK_LIBRARY_PATH", "")
-        tail = " ".join(shlex.quote(a) for a in cmd_after_wine)
-        sh = (f"export DYLD_FALLBACK_LIBRARY_PATH={shlex.quote(dyld)}\n"
-              f"exec {shlex.quote(iw)} {tail}")
-        log(f"installer (pre-HACK22 wine): {cmd_after_wine}")
-        return subprocess.Popen(["/usr/bin/arch", "-x86_64", "/bin/bash", "-lc", sh],
-                                env=env, stdout=out, stderr=subprocess.STDOUT,
-                                start_new_session=True)
-    # no pre-HACK22 overlay -> Wine Stable is a normal (no-HACK22) wine that also runs
-    # 32-bit NSIS/Burn installers clean; use it before falling back to the storming unified wine.
-    stable = _find_wine_stable()
-    if stable:
-        log(f"installer: no pre-HACK22 overlay -> Wine Stable ({stable})")
-        return subprocess.Popen([stable] + list(cmd_after_wine), env=env,
-                                stdout=out, stderr=subprocess.STDOUT,
-                                start_new_session=True)
-    wine = _find_wine()
-    if not wine:
-        raise FileNotFoundError("Wine not found")
-    log("installer: no pre-HACK22 overlay + no Wine Stable -> unified wine (32-bit NSIS/Burn MAY fault-storm)")
-    return subprocess.Popen([wine] + list(cmd_after_wine), env=env,
-                            stdout=out, stderr=subprocess.STDOUT,
-                            start_new_session=True)
-
-
 def _run_installscript_redists(prefix: str, game_dir: str, backend: str) -> None:
     """Actualy INSTALL a Steam games install-script redists (VC++ / Vulkan RT / Rockstar
-    Launcher / Social Club / .NET) via the PRE-HACK22 wine, THEN set their per-redist
+    Launcher / Social Club / .NET) via the unified wine, THEN set their per-redist
     has-run keys so Steam skips its OWN run of them. Steam fires these WoW64/Burn installers
     under our HACK22 wine where they spin at 100% CPU forever + wedge the launch on "Running
-    install script"; the pre-HACK22 wine finishs them clean. Idempotent -- a redist whos
+    install script"; the unified wine (with the wow64cpu ljmp fix) finishs them clean. Idempotent -- a redist whos
     has-run value is allready set on disk is skipd. No-op if no installscript.vdf or the
-    pre-HACK22 wine isnt present. See winemono-32bit-hack22-rootcause."""
-    iw = _prehack22_wine()
+    installscript.vdf is present. See winemono-32bit-hack22-rootcause."""
+    iw = _installer_wine()
     if not iw:
         return
     gd = Path(game_dir)
@@ -4533,7 +4470,7 @@ def _run_installscript_redists(prefix: str, game_dir: str, backend: str) -> None
         return m.group(1) if m else None
     env = _unified_env(prefix, backend or "d3dmetal", False, for_steam=False)
     env["WINEDEBUG"] = "-all"
-    _stage_syswow64(prefix)  # 32-bit subsystem so the pre-HACK22 wine can run these 32-bit redists
+    _stage_syswow64(prefix)  # 32-bit subsystem so the unified wine can run these 32-bit redists
     dyld = env.get("DYLD_FALLBACK_LIBRARY_PATH", "")
     handled = 0
     for vdf in sorted(set(vdfs)):
@@ -4557,7 +4494,7 @@ def _run_installscript_redists(prefix: str, game_dir: str, backend: str) -> None
             unixpath = proc.replace("\\\\", "\\").replace("%INSTALLDIR%", str(gd)).replace("\\", "/")
             if not Path(unixpath).exists():
                 continue
-            log(f"redist pre-install (pre-HACK22): {Path(unixpath).name} {cmd_args}".rstrip())
+            log(f"redist pre-install: {Path(unixpath).name} {cmd_args}".rstrip())
             sh = (f"export DYLD_FALLBACK_LIBRARY_PATH={shlex.quote(dyld)}\n"
                   f"{shlex.quote(iw)} {shlex.quote(unixpath)} {cmd_args} >/dev/null 2>&1")
             try:
@@ -4580,7 +4517,7 @@ def _run_installscript_redists(prefix: str, game_dir: str, backend: str) -> None
                     pass
             handled += 1
     if handled:
-        log(f"redist pre-install: finishd {handled} install-script redist(s) via pre-HACK22 "
+        log(f"redist pre-install: finishd {handled} install-script redist(s) via the unified "
             f"wine so Steam wont fault-storm on them")
 
 
@@ -4594,7 +4531,7 @@ _REDIST_BUILTIN_COVERED = ("vcredist", "vc_redist", "visual c++", "directx", "dx
 
 def _run_shared_commonredist(prefix: str, backend: str) -> None:
     """INSTALL the SHARED 'Steamworks Shared/_CommonRedist' redists that have NO wine builtin
-    (mfc / physx / openal / xna / ...) via the pre-HACK22 overlay wine, so games that need em
+    (mfc / physx / openal / xna / ...) via the unified wine, so games that need em
     actualy get em -- Steams own run of these 32-bit Burn/NSIS installers fault-storms under
     HACK22 so it never installs em, it just marks em has-run. The builtin-coverd ones (VC++ n
     DirectX = wine builtins, .NET = wine-mono) r deliberately SKIPD (redundant). 3 fixes over
@@ -4604,7 +4541,7 @@ def _run_shared_commonredist(prefix: str, backend: str) -> None:
     file, NOT the reg key -- the has-run SKIP path sets that same reg key independently, so a
     reg-key gate would skip forever. On any run failure we STILL leave the has-run key set so a
     launch is never wedged. See canonical-patch + winemono-32bit-hack22-rootcause."""
-    iw = _prehack22_wine()
+    iw = _installer_wine()
     if not iw:
         return
     shared = _steam_dir(prefix) / "steamapps" / "common" / "Steamworks Shared"
@@ -4670,7 +4607,7 @@ def _run_shared_commonredist(prefix: str, backend: str) -> None:
                 runcmd = f"cd {cmd_dir} && {shlex.quote(iw)} cmd /c {base} {cmd_args}".rstrip()
             else:
                 runcmd = f"{shlex.quote(iw)} {shlex.quote(unixpath)} {cmd_args}".rstrip()
-            log(f"shared redist install (pre-HACK22): {Path(unixpath).name} {cmd_args}".rstrip())
+            log(f"shared redist install: {Path(unixpath).name} {cmd_args}".rstrip())
             sh = f"export DYLD_FALLBACK_LIBRARY_PATH={shlex.quote(dyld)}\n{runcmd} >/dev/null 2>&1"
             try:
                 subprocess.run(["/usr/bin/arch", "-x86_64", "/bin/bash", "-lc", sh], env=env, timeout=900)
@@ -4697,7 +4634,7 @@ def _run_shared_commonredist(prefix: str, backend: str) -> None:
             marker_path.write_text(json.dumps(done))
         except Exception:
             pass
-        log(f"shared redist: processd {handled} uncoverd CommonRedist redist(s) via pre-HACK22 wine")
+        log(f"shared redist: processd {handled} uncoverd CommonRedist redist(s) via the unified wine")
 
 
 def _ue_project_token(exe_path: Path, args: str) -> str:
@@ -4748,16 +4685,16 @@ def _launch_game_unified(prefix: str, exe: str, args: str, bottle_cfg: Dict[str,
     exe_path = Path(exe)
     # SteamSetup.exe is a 32-bit NSIS stub that fault-storms on the unified HACK22 wine -> a Play
     # would spin forever with NO window (the storm is the HACK22 WINE, not the d3dmetal/dxmt backend,
-    # so switchin backend wouldnt help at all). route it to the pre-HACK22 installer wine + /S so
+    # so switchin backend wouldnt help at all). route it to the unified installer wine + /S so
     # Steam installs silently (the GUI wizard doesnt reliably surface under wine); a later Play then
     # finds steam.exe n launchs it via DXMT. this is why "Play on a steam bottle w/o Steam" did
     # nothing + logd backend=d3dmetal.
     if exe_path.name.lower() == "steamsetup.exe":
         tail = [str(exe_path)] + (shlex.split(args) if args else ["/S"])
         logf = str(Path(prefix) / "mnc-installer.log")
-        proc = _run_installer_prehack22(str(prefix), tail, "d3dmetal", log_path=logf)
+        proc = _run_installer_unified(str(prefix), tail, "d3dmetal", log_path=logf)
         _running_games[proc.pid] = proc
-        log(f"launch: SteamSetup.exe routed to pre-HACK22 installer wine (silent); log {logf}")
+        log(f"launch: SteamSetup.exe routed to the unified installer wine (silent); log {logf}")
         return {"pid": proc.pid}
     # DEPRECATED 2026-07-25: the EA app (EADesktop.exe) used to be routed to a gated pre-HACK22
     # overlay path (_launch_ea_app, since removed) becuse HACK22 appeard to break its CEF/mscoree
@@ -4802,7 +4739,7 @@ def _launch_game_unified(prefix: str, exe: str, args: str, bottle_cfg: Dict[str,
         except Exception as exc:
             log(f".NET (wine-mono) install skipped: {exc}")
     # Bradar pre-instal the games install-script redists (VC++/Vulkan RT/Rockstar Launcher/
-    # Social Club/.NET) via the pre-HACK22 wine BEFORE steam runs its own install-script.
+    # Social Club/.NET) via the unified wine BEFORE steam runs its own install-script.
     # steam fires them under our HACK22 wine where the 32-bit Burn bundles fault-storm at
     # 100% CPU forever ("stuck on installer script"); this finishs them clean + sets the
     # has-run keys so steam skips its storming run. idempotent (skips already-done ones).
@@ -5622,10 +5559,10 @@ def _download_and_run_steam_setup(prefix: str, wine: str, setup_path: Optional[s
                         exe.write_bytes(resp.read())
                 log("SteamSetup.exe downloaded.")
         logf = str(Path(prefix) / "mnc-installer.log")
-        log(f"Launching SteamSetup.exe in {prefix} (pre-HACK22 wine so the NSIS stub wont fault-storm; log {logf})")
+        log(f"Launching SteamSetup.exe in {prefix} (unified wine; the wow64cpu ljmp fix keeps the NSIS stub from fault-storming; log {logf})")
         # /S = silent install (the SteamSetup GUI wizard doesnt reliably surface under wine); this
         # lands steam.exe so a later Play launchs Steam via DXMT.
-        proc = _run_installer_prehack22(prefix, [str(exe), "/S"], "d3dmetal", log_path=logf)
+        proc = _run_installer_unified(prefix, [str(exe), "/S"], "d3dmetal", log_path=logf)
         _setup_proc = proc
     except Exception as exc:
         log(f"Warning: failed to run SteamSetup: {exc}")
@@ -5727,7 +5664,7 @@ def _download_and_run_eaapp_setup(prefix: str, wine: str, setup_path: Optional[s
         # unified engine is optional; fall back to whatever wine _run_installer_unified will
         # itself fall back to, so the gecko regedit never becomes the thing that fails here
         _ubt = _unified_build_dir()
-        gecko_wine = str(_ubt / "wine") if _ubt else _prehack22_wine()
+        gecko_wine = str(_ubt / "wine") if _ubt else _installer_wine()
         if gecko_wine:
             _apply_gecko_regedit(gecko_wine, install_env)   # mshtml is enabled above (needs_dotnet)
         # the installer stub IS a CEF browser process, and we start it directly, so hand it
@@ -6357,7 +6294,7 @@ def cmd_run_exe(params: Dict[str, Any]) -> Any:
     # so from the UI they look like they never launch + write no logs. tee wine output
     # to a log in the bottle so "Run Installer" isnt a silent black box.
     logf = str(Path(prefix) / "mnc-installer.log")
-    proc = _run_installer_prehack22(str(prefix), tail, "d3dmetal", log_path=logf)
+    proc = _run_installer_unified(str(prefix), tail, "d3dmetal", log_path=logf)
     _running_games[proc.pid] = proc
     log(f"run_exe: {tail} -> pid {proc.pid}; log {logf}")
     return {"pid": proc.pid}
@@ -6418,7 +6355,7 @@ def cmd_uninstall_app(params: Dict[str, Any]) -> Any:
     # fault-storm on. output tees to a log so an uninstall isnt a silent black box.
     logf = str(Path(prefix) / "mnc-uninstall.log")
     log(f"uninstall_app ({method}): {tail}")
-    proc = _run_installer_prehack22(str(prefix), tail, "d3dmetal", log_path=logf)
+    proc = _run_installer_unified(str(prefix), tail, "d3dmetal", log_path=logf)
     _running_games[proc.pid] = proc
     return {"pid": proc.pid, "method": method}
 
@@ -8105,31 +8042,15 @@ def _winetricks_bin() -> Optional[str]:
 
 
 def _winetricks_wine_and_server(prefix: str) -> Tuple[str, str]:
-    """Resolve the wine winetricks should use, following the SAME fallback chain
-    as _run_installer_prehack22 (pre-HACK22 overlay -> Wine Stable -> unified
-    wine + warning). Many winetricks verbs (vcrun*, dotnet*, other 32-bit
-    NSIS/Burn-style installer stubs) fault-storm at ~100% CPU forever under the
-    unified HACK22 wine's broken WoW64 32<->64 transition -- see
-    _prehack22_wine()'s docstring. Deliberately ignores the bottle's own
-    wine_binary preference (stable/staging/auto): that preference is for GAME
+    """Resolve the wine winetricks should use: the unified engine, same as every other
+    installer path (see _installer_wine()). Deliberately ignores the bottle's own
+    wine_binary preference (stable/staging/auto) -- that preference is for GAME
     rendering, not installer compatibility."""
-    iw = _prehack22_wine()
-    if iw:
-        wine = iw
-    else:
-        stable = _find_wine_stable()
-        if stable:
-            log("winetricks: no pre-HACK22 overlay -> Wine Stable")
-            wine = stable
-        else:
-            wine = _find_wine()
-            if not wine:
-                raise FileNotFoundError("Wine not found")
-            log("winetricks: no pre-HACK22 overlay + no Wine Stable -> "
-                "unified wine (32-bit verbs MAY fault-storm)")
+    wine = _installer_wine()
+    if not wine:
+        raise FileNotFoundError("Wine not found")
     # Pass WINESERVER explicitly rather than relying on winetricks' own
-    # dirname(WINE)-relative search, since the pre-HACK22 overlay tree's
-    # layout isn't guaranteed to match that assumption.
+    # dirname(WINE)-relative search.
     return wine, (_find_wineserver() or "")
 
 
@@ -8152,7 +8073,7 @@ def _winetricks_popen(prefix: str, verb: str, force: bool = False) -> subprocess
     if not wtk:
         raise FileNotFoundError("Winetricks isn't installed yet — run Setup first.")
     wine, wineserver = _winetricks_wine_and_server(prefix)
-    # Same prerequisites _run_installer_prehack22 requires: a fast-booted
+    # Same prerequisites _run_installer_unified requires: a fast-booted
     # bottle can have an empty syswow64, which makes 32-bit installers die
     # with c0000135 before winetricks even gets a chance to run them.
     _stage_syswow64(prefix)
@@ -8160,7 +8081,7 @@ def _winetricks_popen(prefix: str, verb: str, force: bool = False) -> subprocess
     env = _winetricks_env(prefix, wine, wineserver)
     env["WINEDEBUG"] = "-all,+err"
     # arch strips DYLD_*, so re-export it inside the subshell -- same pattern
-    # _run_installer_prehack22 uses.
+    # _run_installer_unified uses.
     dyld = env.get("DYLD_FALLBACK_LIBRARY_PATH", "")
     flags = "-q" + (" -f" if force else "")
     sh = (f"export DYLD_FALLBACK_LIBRARY_PATH={shlex.quote(dyld)}\n"

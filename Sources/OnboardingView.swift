@@ -399,19 +399,16 @@ struct OnboardingView: View {
         func add(_ installed: Bool, _ action: String) { if !installed { actions.append(action) } }
         let s = status
         add(s?.hasTools ?? false, "install_tools")
-        // Wine Unified is THE engine now. The old standalone Wine Stable is legacy: nothing
-        // on a fresh box needs it (the 32-bit installer path uses the pre-HACK22 overlay
-        // built by install_wine_installer, and the gnutls it used to supply is bundled as
+        // Wine Unified is THE engine now, installers included — the pre-HACK22 overlay is
+        // gone since the wow64cpu ljmp fix landed. The old standalone Wine Stable is legacy:
+        // nothing on a fresh box needs it (the gnutls it used to supply is bundled as
         // mnc-tls), so it is opt-in via "install everything" insted of a default download.
         add(s?.hasWineUnified ?? false, "install_wine_unified")
-        // build the pre-HACK22 installer overlay + stage the bundled freetype whenever we set up the
-        // unified wine (fresh box). without the overlay, 32-bit installers (SteamSetup / vc_redist /
-        // RGL) fall back to the storming unified wine; without mnc-fonts, no-Homebrew boxes hit the
-        // "cannot find the FreeType font library" error. both r cheap (clonefile / tiny copy) n run
-        // after install_wine_unified (the overlay clones it). onboarding is the ONLY fresh-box path,
-        // so if these arent here a fresh install ships without them (the version gate only fires on
-        // a LATER app-version bump).
-        add(s?.hasWineUnified ?? false, "install_wine_installer")
+        // stage the bundled freetype whenever we set up the unified wine (fresh box) --
+        // without mnc-fonts, no-Homebrew boxes hit the "cannot find the FreeType font
+        // library" error. cheap (tiny copy) n runs after install_wine_unified. onboarding is
+        // the ONLY fresh-box path, so if this isnt here a fresh install ships without it
+        // (the version gate only fires on a LATER app-version bump).
         add(s?.hasWineUnified ?? false, "stage_mnc_fonts")
         if installEverything {
             add(s?.hasWineStable ?? false, "install_wine")
