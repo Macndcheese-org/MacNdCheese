@@ -870,8 +870,9 @@ def _apply_retina_regedit(wine: str, env: dict, retina_mode: bool) -> None:
 
 def _apply_gecko_regedit(wine: str, env: dict) -> None:
     """Point mshtml.dll at Wine Gecko so embedded-HTML/COM rendering (EULA text, WiX Burn's own
-    bootstrapper chrome, any embedded browser control) actually works, for any launch where
-    _unified_env() left mshtml enabled (needs_dotnet=True -- see _unified_env's dll_ovr). Our
+    bootstrapper chrome, any embedded browser control) actually works. mshtml is enabled on
+    every launch now (see _unified_env's mscoree/mshtml note); this supplies the Gecko package
+    it needs to actually render, and is still called only from the needs_dotnet paths. Our
     unified engine ships no Gecko package of its own (unlike Wine Stable/D3DMetal), so builtin
     mshtml.dll loads but can't render anything without this. Sourced from the SAME self-contained
     redist pack that already provisions wine-mono/d3dcompiler_47 for the unified engine (deps/
@@ -1284,7 +1285,7 @@ def _apply_backend_env(env: Dict[str, str], backend: str, debug: bool = False) -
         ):
             env.pop(var, None)
 
-        backend_ovr = "winemenubuilder.exe=d;mscoree=;mshtml=;mf,mfplat,mfreadwrite,mfplay=b;atidxx64,d3d10,d3d11,d3d12,dxgi,nvapi64,nvngx-on-metalfx=n"
+        backend_ovr = "winemenubuilder.exe=d;mf,mfplat,mfreadwrite,mfplay=b;atidxx64,d3d10,d3d11,d3d12,dxgi,nvapi64,nvngx-on-metalfx=n"
 
     elif backend == BACKEND_GPTK:
         mnc_root = PORTABLE_DIR / "Wine Stable.app" / "Contents" / "Resources" / "wine"
@@ -1318,7 +1319,7 @@ def _apply_backend_env(env: Dict[str, str], backend: str, debug: bool = False) -
         ):
             env.pop(var, None)
 
-        backend_ovr = "winemenubuilder.exe=d;mscoree=;mshtml=;mf,mfplat,mfreadwrite,mfplay=b;atidxx64,d3d10,d3d11,d3d12,dxgi,nvapi64,nvngx-on-metalfx=n"
+        backend_ovr = "winemenubuilder.exe=d;mf,mfplat,mfreadwrite,mfplay=b;atidxx64,d3d10,d3d11,d3d12,dxgi,nvapi64,nvngx-on-metalfx=n"
 
     elif backend == BACKEND_GPTK_FULL:
         wineserver = _find_wineserver()
@@ -1510,7 +1511,7 @@ def _backend_launch_cmd(backend: str, wine: str, exe_dir: str, exe_name: str,
             "/usr/local/opt/gnutls/lib", _WINE_STABLE_LIB,
             "/usr/lib",
         ])
-        dll_ovr = "winemenubuilder.exe=d;mscoree=;mshtml=;mf,mfplat,mfreadwrite,mfplay=b;atidxx64,d3d10,d3d11,d3d12,dxgi,nvapi64,nvngx-on-metalfx=n"
+        dll_ovr = "winemenubuilder.exe=d;mf,mfplat,mfreadwrite,mfplay=b;atidxx64,d3d10,d3d11,d3d12,dxgi,nvapi64,nvngx-on-metalfx=n"
         # Forward MTL_HUD_ENABLED through the heredoc if set in the parent env.
         metal_hud_line = "export MTL_HUD_ENABLED=1\n" if extra_env and extra_env.get("MTL_HUD_ENABLED") == "1" else ""
         # Per-game Steam appID (read from steam_appid.txt), not a hardcoded value.
@@ -3240,8 +3241,9 @@ def _install_wine_mono(prefix: str, backend: str = "d3dmetal") -> bool:
     msi = str(msis[-1])   # newest cached
     env = _unified_env(prefix, backend or "d3dmetal", False, for_steam=False)
     env["WINEDEBUG"] = "-all"
-    # mscoree MUST be enabled for msiexec to register mono -> drop it from the override here
-    env["WINEDLLOVERRIDES"] = "winemenubuilder.exe=d;mshtml="
+    # mscoree MUST be enabled for msiexec to register mono. _unified_env no longer disables it
+    # (nor mshtml), so this only needs to keep winemenubuilder out of the way.
+    env["WINEDLLOVERRIDES"] = "winemenubuilder.exe=d"
     _stage_syswow64(prefix)   # 32-bit subsystem so the wine can run the 32-bit MSI
     dyld = env.get("DYLD_FALLBACK_LIBRARY_PATH", "")
     sh = (f"export DYLD_FALLBACK_LIBRARY_PATH={shlex.quote(dyld)}\n"
@@ -3290,11 +3292,15 @@ def _install_corefonts(prefix: str) -> None:
 
 def _game_needs_dotnet(prefix: str, game_dir: str,
                        bottle_cfg: Dict[str, Any], params: Dict[str, Any]) -> bool:
-    """Whether to enable .NET (wine-mono) for THIS game launch. Explicit per-game opt-in
+    """Whether to PROVISION wine-mono for THIS game launch. Explicit per-game opt-in
     (params/bottle_cfg 'needs_dotnet') wins; else auto-detect -- a game that SHIPS a .NET
-    redist in its CommonRedist/Redistributables almost certainly wants .NET. Default OFF so
-    mscoree stays globally disabled (which usefully suppresses the .NET CrashReport
-    red-herring on the majority of games that dont touch .NET at all)."""
+    redist in its CommonRedist/Redistributables almost certainly wants .NET.
+
+    Bradar this no longer gates whether mscoree/mshtml may LOAD -- _unified_env leaves both at
+    wines default now, so a .NET app never needs this flag just to start (see the mscoree note
+    there). It only decides whether we go install the Mono/Gecko packages up front, which is
+    what .NET FRAMEWORK titles need and .NET Core ones do not. Default OFF keeps that install
+    off the hot path for the majority of games that dont touch .NET at all."""
     flag = params.get("needs_dotnet", bottle_cfg.get("needs_dotnet", None))
     if flag is not None:
         return bool(flag)
@@ -3555,7 +3561,7 @@ def _unified_game_backend(bottle_cfg: Dict[str, Any], backend: str = "") -> str:
 
 def _unified_env(prefix: str, game_backend: str, metal_hud: bool = False,
                  for_steam: bool = False, gst_debug: str = "",
-                 needs_dotnet: bool = False, cef_safe_mode: bool = False,
+                 cef_safe_mode: bool = False,
                  debug: bool = False) -> Dict[str, str]:
     """Env for the unified wine. Steam exes always render via DXMT (loader gate);
     non-steam games follow MNC_GAME_BACKEND. GStreamer (MF/H.264 video) is wired for
@@ -3585,18 +3591,34 @@ def _unified_env(prefix: str, game_backend: str, metal_hud: bool = False,
                      str(PORTABLE_DIR / "mnc-fonts"), str(PORTABLE_DIR / "mnc-tls"), str(PORTABLE_DIR / "mnc-vulkan"), str(PORTABLE_DIR / "mnc-sdl"),
                      "/usr/lib"])
     # Bradar d3dcompiler_47=n,b -> the real MS DLL we provision (native FIRST) with wines weak
-    # builtin as fallbak (NEVER native alone, winetricks #2344). mscoree= disables .NET (kills
-    # the CrashReport red-herring) EXCEPT for needs_dotnet games, where wine-mono must load.
-    # mshtml follows the SAME gate as mscoree: a plain game never touches embedded HTML/COM
-    # rendering, but anything needing a real CLR (WiX Burn installers w/ managed custom actions,
-    # EA App) commonly ALSO needs mshtml for its own UI (EULA text, Burn's bootstrapper chrome).
-    # Confirmed live: unconditionally blanking mshtml here broke EA App's installer entirely
-    # (mshtml.dll couldn't even load -> "class not registered" for its HTMLDocument CLSID),
-    # not just a missing-Gecko-path symptom. See _apply_gecko_regedit (called alongside
-    # _install_wine_mono at every needs_dotnet call site) for the matching Gecko provisioning --
-    # builtin mshtml still can't render anything without a Gecko package to point at.
-    _mscoree = "" if needs_dotnet else "mscoree=;"
-    _mshtml = "" if needs_dotnet else "mshtml=;"
+    # builtin as fallbak (NEVER native alone, winetricks #2344).
+    #
+    # Bradar mscoree + mshtml are deliberately NOT disabled here any more (2026-08-05). Both
+    # were inherited whole from the Apple GPTK / CrossOver D3DMetal boilerplate string and then
+    # carried into the unified engine, where they applied to EVERY launch rather than just the
+    # D3DMetal targets they were copied for. Disabling mscoree is not a no-op for non-.NET
+    # apps -- wines PE loader routes ANY IL-only image through fixup_imports_ilonly(), which
+    # hard-requires mscoree.dll, so a disabled mscoree makes LoadLibraryEx() of an IL-only
+    # assembly fail with STATUS_DLL_NOT_FOUND. .NET Core hits that on its FIRST assembly:
+    # System.Runtime.dll is a pure IL-only facade, so CoreCLR throws EEFileLoadException
+    # (HRESULT 0x8007007E) out of coreclr_execute_assembly and the process dies before any
+    # window appears. That is what killed LuaTools (.NET 8 WPF) on every launch, and it is the
+    # same override behind EA App's installer 1603/JunoInitializeSession failure documented in
+    # _download_and_run_eaapp_setup. Epic/Amazon launches never passed needs_dotnet at all, so
+    # nothing there could ever opt out of it either.
+    #
+    # Bradar leaving them at wines default costs nothing measurable: both are LAZY -- the loader
+    # only maps them when something actually loads an IL-only image / an HTML control, so a game
+    # that never touches .NET never loads mscoree (measured: exactly one mscoree map across a
+    # full LuaTools startup trace, and zero Mono errors with wine-mono not even installed --
+    # fixup_imports_ilonly only needs mscoree to export _CorDllMain, not a live Mono runtime).
+    # The prefix-creation hang that originally motivated suppressing Mono is fixed properly at
+    # the engine level instead, in dlls/appwiz.cpl/addons.c (install_addon() returns early), and
+    # that patch's own comment notes it makes prefix creation fast with NO env overrides.
+    #
+    # Bradar needs_dotnet still matters at the CALL SITES -- it gates _install_wine_mono() and
+    # _apply_gecko_regedit(), which provision the actual Mono/Gecko packages that a real CLR or
+    # a rendering mshtml needs. It just no longer decides whether the DLLs may load at all.
     # Bradar msvcp140_2 + vcruntime140_1 native: UE bootstrappers (BootstrapPackagedGame)
     # dont trust the VC\Runtimes reg keys -- they read the VERSION RESOURCE of those two
     # DLLs in system32 n compare it to the redist they ship. wines builtins r stamped
@@ -3606,8 +3628,8 @@ def _unified_env(prefix: str, game_backend: str, metal_hud: bool = False,
     # = launch wedged w/ no window. The real MS DLLs r allready in system32 (the redist
     # installs them), so prefer em; ",b" keeps wines builtin as fallback on prefixes that
     # dont have em, which behaves exactly as before.
-    dll_ovr = (f"winemenubuilder.exe=d;{_mscoree}{_mshtml}d3dcompiler_47=n,b;"
-               f"msvcp140_2,vcruntime140_1=n,b;nvapi,nvapi64=")
+    dll_ovr = ("winemenubuilder.exe=d;d3dcompiler_47=n,b;"
+               "msvcp140_2,vcruntime140_1=n,b;nvapi,nvapi64=")
     env.update({
         "WINEPREFIX": str(prefix),
         # msync OFF by default. The bundled unified wine is msync-capable (server
@@ -4790,8 +4812,7 @@ def _launch_game_unified(prefix: str, exe: str, args: str, bottle_cfg: Dict[str,
             except Exception as exc:
                 log(f"unified: steam auto-launch failed: {exc} (continuing)")
     env = _unified_env(prefix, backend, metal_hud, gst_debug=("5" if debug else "3"),
-                       needs_dotnet=needs_dotnet, cef_safe_mode=force_cef,
-                       debug=debug)
+                       cef_safe_mode=force_cef, debug=debug)
     # Rockstar: make d3d12 cleanly ABSENT. The Social Club CEF resolves D3D12CreateDevice
     # dynamicaly and calls it through an UNGUARDED proc-table slot -- with our half-alive
     # d3d12 stub loaded the slot ends up NULL and every helper dies calling address 0
@@ -5377,7 +5398,7 @@ def cmd_launch_steam(params: Dict[str, Any]) -> Any:
     export DYLD_FALLBACK_LIBRARY_PATH={shlex.quote(dyld_fallback)}
     export ROSETTA_ADVERTISE_AVX=1
     {metal_hud_line}unset GTK_PATH GTK_EXE_PREFIX GTK_DATA_PREFIX GDK_PIXBUF_MODULEDIR GDK_PIXBUF_MODULE_FILE GTK_IM_MODULE_FILE XDG_DATA_DIRS
-    export WINEDLLOVERRIDES="winemenubuilder.exe=d;mscoree=;mshtml="
+    export WINEDLLOVERRIDES="winemenubuilder.exe=d"
     export WINEDEBUG=-all
     export WINEDBG=-all
     cd {shlex.quote(str(steam_dir))} || exit 1
@@ -5606,7 +5627,10 @@ def _download_and_run_eaapp_setup(prefix: str, wine: str, setup_path: Optional[s
     L"JunoInitializeSession" returned 1603" plus repeated
     "err:mscoree:LoadLibraryShim error reading registry key for installroot" --
     an install-time custom action needs a working CLR, which the plain
-    for_steam=False env explicitly disables (mscoree=;). Matches a public
+    for_steam=False env explicitly disabled at the time (mscoree=;). That blanket
+    disable is gone as of 2026-08-05 (see _unified_env), so the CLR half of this
+    is no longer self-inflicted; the wine-mono/corefonts/d3dcompiler_47
+    provisioning below is still genuinely needed. Matches a public
     Linux Mint forum report hitting the identical JunoInitializeSession/1603
     failure. A bottle that happened to already have these from unrelated
     earlier winetricks/game activity (real d3dcompiler_47 via `winetricks
@@ -5676,7 +5700,7 @@ def _download_and_run_eaapp_setup(prefix: str, wine: str, setup_path: Optional[s
         # path as everything else: DXMT + cef_safe_mode, and real GPU rendering rather than
         # the software fallback. The prerequisites above stay -- they are genuinely needed.
         install_env = _unified_env(prefix, "dxmt", False, for_steam=False,
-                                   needs_dotnet=True, cef_safe_mode=True)
+                                   cef_safe_mode=True)
         install_env["WINEDEBUG"] = "-all,+err"
         # unified engine is optional; fall back to whatever wine _run_installer_unified will
         # itself fall back to, so the gecko regedit never becomes the thing that fails here
