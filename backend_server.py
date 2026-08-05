@@ -3136,8 +3136,19 @@ def _disable_shadowing_builtins() -> int:
 
 def _stage_unified_dlls(prefix: str) -> None:
     """Copy the unified d3d DLL slots into a prefix system32 so the loader has
-    real targets to route to (canonical=DXMT plus *_d3dm and *_dxvk). Idempotent:
-    only copies when the dest is missing or a different size."""
+    real targets to route to (canonical=DXMT plus *_d3dm and *_dxvk).
+
+    Idempotent, but it MUST NOT key idempotency on size alone. Successive DXMT
+    builds land on byte-identical sizes (section alignment pads them out), so a
+    size-only check silently pins whatever build a prefix was first staged with
+    and no pack update ever reaches it. Live example 2026-08-05: the Steam prefix
+    ran DXMT v0.80-108 while the pack had shipped v0.80-132 for 24 commits --
+    all three *_dxmt DLLs matched on size and differed in content.
+
+    Compare mtime as well: shutil.copy2 preserves the source mtime, so a copy
+    made from an older pack carries that pack's timestamp. The 2s tolerance is
+    for filesystems with coarse mtime granularity (exFAT), which would otherwise
+    re-copy several MB on every launch."""
     _disable_shadowing_builtins()
     src_dir = _unified_d3d_dir()
     if src_dir is None:
@@ -3153,7 +3164,13 @@ def _stage_unified_dlls(prefix: str) -> None:
             continue
         dst = sys32 / dll
         try:
-            if not dst.exists() or src.stat().st_size != dst.stat().st_size:
+            if not dst.exists():
+                stale = True
+            else:
+                ss, ds = src.stat(), dst.stat()
+                stale = (ss.st_size != ds.st_size
+                         or abs(ss.st_mtime - ds.st_mtime) > 2)
+            if stale:
                 shutil.copy2(str(src), str(dst))
                 staged += 1
         except Exception as exc:
