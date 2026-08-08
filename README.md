@@ -3,8 +3,7 @@
 </p>
 
 # MacNCheese - STILL IN BETA TESTING
-### Windows games on Mac, made free & easy
- The proton mac never had -no subscriptions, no paywalls, just games.
+### Windows games on Mac, made free and easy
 
 
 
